@@ -14,19 +14,15 @@ The installer is not code-signed yet, so Windows SmartScreen shows "Windows prot
 
 ## Using it
 
-1. Open **Papyrus** from the Start menu. The replay buffer starts **off**.
-2. Click the big button to turn the replay buffer on. Click it again to turn it off.
-3. While it is on, press **Ctrl+Shift+F9** (or click **Save clip now**) to save the last 30 seconds. High beep = saved, low beep = failed.
-4. Choose what to record: **Fullscreen apps and games only** (default; records only while a fullscreen app is running, including when you tab out of it) or **Whole screen**.
-5. Set the save hotkey, clip length (15 s to 2 min), frame rate (120/60/30) and quality (4K down to 480p) in the same window.
-6. Tick **Always on** to have Papyrus start with Windows with the buffer already on.
-7. Closing the window keeps Papyrus in the tray near the clock. Right-click the icon and choose **Exit Papyrus** to quit.
+Open **Papyrus** from the Start menu.
 
-Clips are in `Videos\Papyrus`.
+- **Clips** shows your clips as a grid of thumbnails. Rest the pointer on one for 2 seconds to preview it; click it to open the editor.
+- **The editor** plays the clip, shows each sound track on its own row, and lets you shorten the clip, drop or shorten individual sound tracks, change a track's volume, and save the result as a new clip. The picture is never re-encoded.
+- **Settings** has the replay buffer switch (off until you turn it on), Always on, what to record (fullscreen apps and games only, or the whole screen), the save hotkey (Ctrl+Shift+F9 by default), clip length, frame rate, quality and the microphone.
 
-## Papyrus Studio
+While the buffer is on, press the hotkey to save the last 30 seconds. High beep = saved, low beep = failed. Clips go to `Videos\Papyrus`.
 
-Click **Clips and editor** to open Studio. It lists your clips, plays them, shows each sound track on its own row, and lets you shorten the clip, drop or shorten individual sound tracks, change a track's volume, and save the result as a new clip. The picture is never re-encoded.
+Closing the window does not stop recording: a small recorder stays in the tray near the clock. Right-click its icon and choose **Exit Papyrus** to quit.
 
 The video is HEVC (H.265). VLC plays it directly; Windows' own players need the "HEVC Video Extensions" add-on from the Microsoft Store.
 
@@ -54,7 +50,7 @@ Needs Python with `pip install ziglang`.
 sh build.sh
 ```
 
-This produces `dist/papyrus-engine.exe`. Studio is a WinUI 3 app in `studio/` (`dotnet publish`, .NET 8). The setup wizard is built with Inno Setup 6 from `installer/papyrus.iss`; see `.github/workflows/release.yml`.
+This produces `dist/papyrus-engine.exe`. The Papyrus app is a WinUI 3 project in `app/` (`dotnet publish`, .NET 8). The setup wizard is built with Inno Setup 6 from `installer/papyrus.iss`; see `.github/workflows/release.yml`.
 
 ## Licence
 

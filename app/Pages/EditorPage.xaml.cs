@@ -1,21 +1,37 @@
-using System.Diagnostics;
 using System.Globalization;
 using System.Runtime.InteropServices;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Controls.Primitives;
-using Windows.Graphics;
+using Microsoft.UI.Xaml.Navigation;
+using Papyrus.Services;
 using Windows.Media.Core;
 using Windows.Media.Playback;
 
-namespace PapyrusStudio;
+namespace Papyrus.Pages;
 
 /// <summary>
-/// The whole Studio app: clip list on the left, player and editor on the right.
-/// All real work on files is done by papyrus-engine.exe (--info and --edit); this window only describes the job.
+/// The editor for one clip: player, clip length, and a row per sound track. Opened by clicking a clip on the
+/// Clips page. All real work on files is done by papyrus-engine.exe (--info and --edit).
 /// </summary>
-public sealed partial class MainWindow : Window
+public sealed partial class EditorPage : Page
 {
+    public EditorPage()
+    {
+        InitializeComponent();
+        _timer.Tick += Timer_Tick;
+        Unloaded += (_, _) => { _timer.Stop(); _playingSelection = false; try { Player.MediaPlayer?.Pause(); } catch { } Player.Source = null; };
+    }
+
+    protected override async void OnNavigatedTo(NavigationEventArgs e)
+    {
+        base.OnNavigatedTo(e);
+        _timer.Start();
+        if (e.Parameter is string path) await OpenClipAsync(path);
+    }
+
+    private void Back_Click(object sender, RoutedEventArgs e) => App.Window?.ShowClips(_clipPath);
+
     private sealed class TrackRow
     {
         public int Number;                 // 1-based sound track number in the clip
@@ -27,8 +43,6 @@ public sealed partial class MainWindow : Window
         public Slider Volume = null!;
     }
 
-    private readonly string _clipsDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyVideos), "Papyrus");
-    private readonly string _dataDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Papyrus");
     private readonly List<TrackRow> _tracks = new();
     private readonly DispatcherTimer _timer = new() { Interval = TimeSpan.FromMilliseconds(100) };
     private MediaPlaybackItem? _item;
@@ -37,31 +51,9 @@ public sealed partial class MainWindow : Window
     private bool _playingSelection;
     private bool _loading;
 
-    public MainWindow()
-    {
-        InitializeComponent();
-        try
-        {
-            AppWindow.Resize(new SizeInt32(1320, 900));
-        }
-        catch { /* cosmetic only */ }
-
-        _timer.Tick += Timer_Tick;
-        _timer.Start();
-        Closed += (_, _) => { _timer.Stop(); Player.Source = null; };
-        LoadClips(null);
-    }
-
     // ---------------------------------------------------------------------------------------------------------
     // Helpers
     // ---------------------------------------------------------------------------------------------------------
-    public void ShowStatus(string message, bool error)
-    {
-        Status.Severity = error ? InfoBarSeverity.Error : InfoBarSeverity.Success;
-        Status.Message = message;
-        Status.IsOpen = true;
-    }
-
     private static string Clock(double seconds)
     {
         if (seconds < 0) seconds = 0;
@@ -69,80 +61,10 @@ public sealed partial class MainWindow : Window
         return string.Format(CultureInfo.InvariantCulture, "{0}:{1:00.0}", m, seconds - m * 60);
     }
 
-    private string EnginePath()
-    {
-        string here = AppContext.BaseDirectory;
-        string parent = Path.GetFullPath(Path.Combine(here, "..", "papyrus-engine.exe"));
-        return File.Exists(parent) ? parent : Path.Combine(here, "papyrus-engine.exe");
-    }
-
-    private async Task<int> RunEngineAsync(IEnumerable<string> args)
-    {
-        var psi = new ProcessStartInfo(EnginePath()) { UseShellExecute = false, CreateNoWindow = true };
-        foreach (string a in args) psi.ArgumentList.Add(a);
-        using var p = Process.Start(psi);
-        if (p == null) return -1;
-        await p.WaitForExitAsync();
-        return p.ExitCode;
-    }
-
-    private string LastEngineError()
-    {
-        try
-        {
-            string f = Path.Combine(_dataDir, "last-edit-error.txt");
-            return File.Exists(f) ? File.ReadAllText(f) : "unknown error";
-        }
-        catch { return "unknown error"; }
-    }
-
     private TimeSpan Position
     {
         get => Player.MediaPlayer?.PlaybackSession?.Position ?? TimeSpan.Zero;
         set { if (Player.MediaPlayer?.PlaybackSession != null) Player.MediaPlayer.PlaybackSession.Position = value; }
-    }
-
-    // ---------------------------------------------------------------------------------------------------------
-    // Clip list
-    // ---------------------------------------------------------------------------------------------------------
-    private void LoadClips(string? select)
-    {
-        ClipList.Items.Clear();
-        if (!Directory.Exists(_clipsDir)) return;
-        var files = new DirectoryInfo(_clipsDir).GetFiles("*.mp4").OrderByDescending(f => f.LastWriteTime).ToList();
-        ListViewItem? toSelect = null;
-        foreach (var f in files)
-        {
-            var panel = new StackPanel { Spacing = 2, Padding = new Thickness(0, 6, 0, 6) };
-            panel.Children.Add(new TextBlock { Text = Path.GetFileNameWithoutExtension(f.Name), TextTrimming = TextTrimming.CharacterEllipsis });
-            panel.Children.Add(new TextBlock
-            {
-                Text = string.Format(CultureInfo.CurrentCulture, "{0:g}  ·  {1:0.0} MB", f.LastWriteTime, f.Length / 1048576.0),
-                Opacity = 0.65,
-                FontSize = 12,
-            });
-            var item = new ListViewItem { Content = panel, Tag = f.FullName };
-            ClipList.Items.Add(item);
-            if (select != null && string.Equals(f.FullName, select, StringComparison.OrdinalIgnoreCase)) toSelect = item;
-        }
-        if (toSelect != null) ClipList.SelectedItem = toSelect;
-    }
-
-    private void Refresh_Click(object sender, RoutedEventArgs e) => LoadClips(_clipPath);
-
-    private void OpenFolder_Click(object sender, RoutedEventArgs e)
-    {
-        try
-        {
-            Directory.CreateDirectory(_clipsDir);
-            Process.Start(new ProcessStartInfo(_clipsDir) { UseShellExecute = true });
-        }
-        catch (Exception ex) { ShowStatus(ex.Message, true); }
-    }
-
-    private async void ClipList_SelectionChanged(object sender, SelectionChangedEventArgs e)
-    {
-        if (ClipList.SelectedItem is ListViewItem item && item.Tag is string path) await OpenClipAsync(path);
     }
 
     // ---------------------------------------------------------------------------------------------------------
@@ -166,15 +88,15 @@ public sealed partial class MainWindow : Window
         ClipTitle.Text = Path.GetFileName(path);
 
         // Ask the engine what is in the file.
-        Directory.CreateDirectory(_dataDir);
-        string infoFile = Path.Combine(_dataDir, "studio-info.txt");
+        Directory.CreateDirectory(Engine.DataDir);
+        string infoFile = Path.Combine(Engine.DataDir, "studio-info.txt");
         try { File.Delete(infoFile); } catch { }
-        int code = await RunEngineAsync(new[] { "--info", path, "--out", infoFile });
+        int code = await Engine.RunAsync(new[] { "--info", path, "--out", infoFile });
         if (_clipPath != path) return;                     // the user already picked another clip
         if (code != 0 || !File.Exists(infoFile))
         {
             Player.Source = null;
-            ShowStatus("This clip cannot be opened: " + LastEngineError(), true);
+            App.Window?.ShowStatus("This clip cannot be opened: " + Engine.LastError(), true);
             _loading = false;
             return;
         }
@@ -242,7 +164,7 @@ public sealed partial class MainWindow : Window
             if (sender is RadioButton rb && rb.Tag is int index && _item != null && index < _item.AudioTracks.Count)
                 _item.AudioTracks.SelectedIndex = index;
         }
-        catch (Exception ex) { ShowStatus("Could not switch the sound track: " + ex.Message, true); }
+        catch (Exception ex) { App.Window?.ShowStatus("Could not switch the sound track: " + ex.Message, true); }
     }
 
     // ---------------------------------------------------------------------------------------------------------
@@ -296,7 +218,7 @@ public sealed partial class MainWindow : Window
         if (_clipPath == null) return;
         string source = _clipPath;
         string name = Path.GetFileNameWithoutExtension(source);
-        string output = Path.Combine(_clipsDir, string.Format(CultureInfo.InvariantCulture, "{0}-edit-{1:HHmmss}.mp4", name, DateTime.Now));
+        string output = Path.Combine(Engine.ClipsDir, string.Format(CultureInfo.InvariantCulture, "{0}-edit-{1:HHmmss}.mp4", name, DateTime.Now));
 
         var args = new List<string>
         {
@@ -315,15 +237,15 @@ public sealed partial class MainWindow : Window
 
         SaveButton.IsEnabled = false;
         Busy.IsActive = true;
-        int code = await RunEngineAsync(args);
+        int code = await Engine.RunAsync(args);
         Busy.IsActive = false;
         SaveButton.IsEnabled = true;
         if (code == 0 && File.Exists(output))
         {
-            ShowStatus("Saved " + Path.GetFileName(output), false);
-            LoadClips(output);
+            App.Window?.ShowStatus("Saved " + Path.GetFileName(output) + ". It is open in the editor now.", false);
+            await OpenClipAsync(output);
         }
-        else ShowStatus("The clip could not be saved: " + LastEngineError(), true);
+        else App.Window?.ShowStatus("The clip could not be saved: " + Engine.LastError(), true);
     }
 
     private async void Delete_Click(object sender, RoutedEventArgs e)
@@ -332,7 +254,7 @@ public sealed partial class MainWindow : Window
         string path = _clipPath;
         var dialog = new ContentDialog
         {
-            XamlRoot = RootGrid.XamlRoot,
+            XamlRoot = XamlRoot,
             Title = "Delete this clip?",
             Content = Path.GetFileName(path) + " will be moved to the Recycle Bin.",
             PrimaryButtonText = "Delete",
@@ -346,11 +268,9 @@ public sealed partial class MainWindow : Window
         _clipPath = null;
         SetEditorEnabled(false);
         await Task.Delay(300);                              // let the player let go of the file
-        if (RecycleBin.Send(path)) { ShowStatus("Moved to the Recycle Bin.", false); ClipTitle.Text = "Pick a clip on the left."; }
-        else ShowStatus("The clip could not be deleted. Is it open in another program?", true);
-        _tracks.Clear();
-        TracksPanel.Children.Clear();
-        LoadClips(null);
+        if (RecycleBin.Send(path)) App.Window?.ShowStatus("Moved to the Recycle Bin.", false);
+        else App.Window?.ShowStatus("The clip could not be deleted. Is it open in another program?", true);
+        App.Window?.ShowClips();
     }
 }
 

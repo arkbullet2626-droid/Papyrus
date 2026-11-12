@@ -1,4 +1,4 @@
-# Builds the engine, the Studio app and the setup wizard.
+# Builds the engine, the Papyrus app and the setup wizard.
 #   - push to main: also publishes a GitHub release for the version in VERSION, if that release does not exist yet
 #   - push to a dev/ branch or a manual run: build only; the installer is attached to the run as an artifact
 name: Release
@@ -37,13 +37,13 @@ jobs:
           python -m pip install --quiet ziglang
           sh build.sh
 
-      - name: Publish Studio app
+      - name: Publish Papyrus app
         shell: pwsh
         run: >
-          dotnet publish studio/PapyrusStudio.csproj
+          dotnet publish app/Papyrus.csproj
           -c Release -r win-x64 -p:Platform=x64 --self-contained true
           -p:Version=${{ steps.ver.outputs.version }}
-          -o dist/studio
+          -o dist/app
 
       - name: Build setup wizard
         shell: pwsh
