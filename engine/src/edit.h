@@ -213,6 +213,51 @@ static inline bool writeInfo(const PathChar* in, const PathChar* out, std::strin
     return true;
 }
 
+// Decodes one whole sound track to 16-bit stereo PCM (Windows only; see aud::decodeTrack).
+typedef bool (*DecodeFn)(const std::vector<std::vector<uint8_t>>& in, std::vector<int16_t>& pcm, uint32_t* missingFrames);
+
+// Writes the loudness outline of every sound track for the editor's waveforms: one line per track,
+// "track=<n>|<hex>", where hex is `buckets` bytes (0-255 peak level) spread evenly over the clip's full length.
+static inline bool writePeaks(const PathChar* in, const PathChar* out, int buckets, DecodeFn decode, std::string& err) {
+    Clip c;
+    if (!load(in, c, err)) return false;
+    if (!decode) { err = "waveforms are not available here"; return false; }
+    FILE* o = openFile(out, L"wb");
+    if (!o) { err = "could not write the waveform file"; return false; }
+    const double clipSeconds = (double)c.tracks[0].sizes.size() / c.tracks[0].timescale;
+    for (size_t i = 1; i < c.tracks.size(); i++) {
+        const InTrack& a = c.tracks[i];
+        std::vector<std::vector<uint8_t>> pk(a.sizes.size());
+        bool ok = true;
+        for (size_t k = 0; k < pk.size() && ok; k++) {
+            pk[k].resize(a.sizes[k]);
+            ok = !PAPYRUS_FSEEK(c.f, (long long)a.offs[k], SEEK_SET) && fread(pk[k].data(), 1, pk[k].size(), c.f) == pk[k].size();
+        }
+        std::vector<int16_t> pcm;
+        uint32_t missing = 0;
+        std::vector<uint8_t> peak((size_t)buckets, 0);
+        if (ok && decode(pk, pcm, &missing)) {
+            const size_t frames = pcm.size() / 2;
+            for (size_t j = 0; j < frames; j++) {
+                // where this sample plays on the clip's timeline
+                const double t = a.emptyMs / 1000.0 + ((double)j + missing - a.skipSamples) / (double)Mp4Mux::AUDIO_RATE;
+                if (t < 0 || t >= clipSeconds) continue;
+                const size_t b = (size_t)(t / clipSeconds * buckets);
+                int v = pcm[j * 2] < 0 ? -pcm[j * 2] : pcm[j * 2];
+                const int r = pcm[j * 2 + 1] < 0 ? -pcm[j * 2 + 1] : pcm[j * 2 + 1];
+                if (r > v) v = r;
+                const uint8_t lvl = (uint8_t)(v >= 32767 ? 255 : v * 255 / 32767);
+                if (b < peak.size() && lvl > peak[b]) peak[b] = lvl;
+            }
+        }
+        fprintf(o, "track=%u|", (unsigned)i);
+        for (uint8_t v : peak) fprintf(o, "%02x", v);
+        fprintf(o, "\n");
+    }
+    fclose(o);
+    return true;
+}
+
 // startMs/endMs: the part of the clip to keep (endMs < 0 = to the end). edits[i] applies to the i-th sound track.
 // On success *actualStartMs is where the new clip really starts (the keyframe at or before startMs).
 static inline bool trim(const PathChar* in, const PathChar* out, int64_t startMs, int64_t endMs, const TrackEdit* edits, int nEdits,

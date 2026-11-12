@@ -4,6 +4,7 @@ using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Controls.Primitives;
 using Microsoft.UI.Xaml.Navigation;
+using Papyrus.Controls;
 using Papyrus.Services;
 using Windows.Media.Core;
 using Windows.Media.Playback;
@@ -19,6 +20,10 @@ public sealed partial class EditorPage : Page
     public EditorPage()
     {
         InitializeComponent();
+        _videoBar = new RangeBar(Windows.UI.Color.FromArgb(255, 230, 60, 60), true) { StartStep = 1, MinLength = 1 };
+        _videoBar.RangeChanged += UpdateTrimLabels;
+        _videoBar.SeekRequested += Seek;
+        VideoBarHost.Children.Add(_videoBar);
         _timer.Tick += Timer_Tick;
         Unloaded += (_, _) => { _timer.Stop(); _playingSelection = false; try { Player.MediaPlayer?.Pause(); } catch { } Player.Source = null; };
     }
@@ -38,8 +43,7 @@ public sealed partial class EditorPage : Page
         public string Name = "";
         public RadioButton Listen = null!;
         public CheckBox Keep = null!;
-        public NumberBox Start = null!;
-        public NumberBox End = null!;
+        public RangeBar Bar = null!;
         public Slider Volume = null!;
     }
 
@@ -50,6 +54,12 @@ public sealed partial class EditorPage : Page
     private double _duration;              // seconds
     private bool _playingSelection;
     private bool _loading;
+    private RangeBar _videoBar = null!;
+    private static readonly Windows.UI.Color[] TrackColors =
+    {
+        Windows.UI.Color.FromArgb(255, 76, 175, 80), Windows.UI.Color.FromArgb(255, 30, 215, 96),
+        Windows.UI.Color.FromArgb(255, 114, 137, 218), Windows.UI.Color.FromArgb(255, 255, 167, 38),
+    };
 
     // ---------------------------------------------------------------------------------------------------------
     // Helpers
@@ -72,9 +82,14 @@ public sealed partial class EditorPage : Page
     // ---------------------------------------------------------------------------------------------------------
     private void SetEditorEnabled(bool on)
     {
-        StartSlider.IsEnabled = on; EndSlider.IsEnabled = on;
-        StartHereButton.IsEnabled = on; EndHereButton.IsEnabled = on;
-        PlaySelectionButton.IsEnabled = on; SaveButton.IsEnabled = on; DeleteButton.IsEnabled = on;
+        _videoBar.IsHitTestVisible = on;
+        PlaySelectionButton.IsEnabled = on; ResetButton.IsEnabled = on; SaveButton.IsEnabled = on; DeleteButton.IsEnabled = on;
+    }
+
+    private void Seek(double seconds)
+    {
+        _playingSelection = false;
+        Position = TimeSpan.FromSeconds(seconds);
     }
 
     private async Task OpenClipAsync(string path)
@@ -121,39 +136,56 @@ public sealed partial class EditorPage : Page
         NoTracksLabel.Visibility = _tracks.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
         ClipTitle.Text = string.Format(CultureInfo.InvariantCulture, "{0}   ·   {1}x{2}, {3} fps, {4}", Path.GetFileName(path), width, height, fps, Clock(_duration));
 
-        StartSlider.Maximum = Math.Max(0, Math.Floor(_duration) - 1);
-        StartSlider.Value = 0;
-        EndSlider.Maximum = _duration;
-        EndSlider.Value = _duration;
+        _videoBar.Reset(_duration);
+        foreach (var t in _tracks) t.Bar.Reset(_duration);
         UpdateTrimLabels();
 
         _item = new MediaPlaybackItem(MediaSource.CreateFromUri(new Uri(path)));
         Player.Source = _item;
         SetEditorEnabled(true);
         _loading = false;
+
+        // Waveforms arrive a moment later; the editor is usable meanwhile.
+        var peaks = await Engine.PeaksAsync(path);
+        if (_clipPath != path) return;
+        foreach (var t in _tracks)
+            if (peaks.TryGetValue(t.Number, out byte[]? data)) t.Bar.SetPeaks(data);
     }
 
     private void AddTrackRow(int number, string name)
     {
         var row = new TrackRow { Number = number, Name = name };
-        var grid = new Grid { ColumnSpacing = 12 };
-        foreach (double w in new double[] { 130, 90, 80, 130, 130 }) grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(w) });
-        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        var color = TrackColors[_tracks.Count % TrackColors.Length];
+
+        var header = new Grid { ColumnSpacing = 16 };
+        header.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(140) });
+        header.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        header.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        header.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(110) });
+        header.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
 
         var title = new TextBlock { Text = name, VerticalAlignment = VerticalAlignment.Center, FontWeight = Microsoft.UI.Text.FontWeights.SemiBold };
         row.Listen = new RadioButton { Content = "Listen", GroupName = "ListenTrack", IsChecked = _tracks.Count == 0, MinWidth = 0, Tag = _tracks.Count };
         row.Listen.Checked += Listen_Checked;
         row.Keep = new CheckBox { Content = "Keep", IsChecked = true, MinWidth = 0 };
-        row.Start = new NumberBox { Header = "Start (s)", Minimum = 0, Maximum = _duration, Value = 0, SmallChange = 1, SpinButtonPlacementMode = NumberBoxSpinButtonPlacementMode.Compact };
-        row.End = new NumberBox { Header = "End (s)", Minimum = 0, Maximum = Math.Ceiling(_duration), Value = Math.Round(_duration, 1), SmallChange = 1, SpinButtonPlacementMode = NumberBoxSpinButtonPlacementMode.Compact };
-        row.Volume = new Slider { Header = "Volume 100%", Minimum = 0, Maximum = 200, Value = 100, StepFrequency = 5 };
-        row.Volume.ValueChanged += (s, _) => { if (s is Slider sl) sl.Header = string.Format(CultureInfo.InvariantCulture, "Volume {0:0}%", sl.Value); };
+        var volumeLabel = new TextBlock { Text = "Volume 100%", VerticalAlignment = VerticalAlignment.Center, HorizontalAlignment = HorizontalAlignment.Right };
+        row.Volume = new Slider { Minimum = 0, Maximum = 200, Value = 100, StepFrequency = 5, VerticalAlignment = VerticalAlignment.Center, MaxWidth = 320, HorizontalAlignment = HorizontalAlignment.Stretch };
+        row.Volume.ValueChanged += (s, _) => { if (s is Slider sl) volumeLabel.Text = string.Format(CultureInfo.InvariantCulture, "Volume {0:0}%", sl.Value); };
 
-        Grid.SetColumn(title, 0); Grid.SetColumn(row.Listen, 1); Grid.SetColumn(row.Keep, 2);
-        Grid.SetColumn(row.Start, 3); Grid.SetColumn(row.End, 4); Grid.SetColumn(row.Volume, 5);
-        grid.Children.Add(title); grid.Children.Add(row.Listen); grid.Children.Add(row.Keep);
-        grid.Children.Add(row.Start); grid.Children.Add(row.End); grid.Children.Add(row.Volume);
-        TracksPanel.Children.Add(grid);
+        Grid.SetColumn(title, 0); Grid.SetColumn(row.Listen, 1); Grid.SetColumn(row.Keep, 2); Grid.SetColumn(volumeLabel, 3); Grid.SetColumn(row.Volume, 4);
+        header.Children.Add(title); header.Children.Add(row.Listen); header.Children.Add(row.Keep); header.Children.Add(volumeLabel); header.Children.Add(row.Volume);
+
+        row.Bar = new RangeBar(color, false) { MinLength = 0.2 };
+        row.Bar.Reset(_duration > 0 ? _duration : 1);
+        row.Bar.SeekRequested += Seek;
+        // A track that is left out is shown faded.
+        row.Keep.Checked += (_, _) => row.Bar.Opacity = 1;
+        row.Keep.Unchecked += (_, _) => row.Bar.Opacity = 0.35;
+
+        var block = new StackPanel { Spacing = 6 };
+        block.Children.Add(header);
+        block.Children.Add(row.Bar);
+        TracksPanel.Children.Add(block);
         _tracks.Add(row);
     }
 
@@ -172,38 +204,32 @@ public sealed partial class EditorPage : Page
     // ---------------------------------------------------------------------------------------------------------
     private void UpdateTrimLabels()
     {
-        StartLabel.Text = Clock(StartSlider.Value);
-        EndLabel.Text = Clock(EndSlider.Value);
-        LengthLabel.Text = "New length: " + Clock(Math.Max(0, EndSlider.Value - StartSlider.Value));
+        LengthLabel.Text = string.Format(CultureInfo.InvariantCulture, "{0}  to  {1}     new length {2}",
+                                         Clock(_videoBar.Start), Clock(_videoBar.End), Clock(Math.Max(0, _videoBar.End - _videoBar.Start)));
     }
 
-    private void Trim_ValueChanged(object sender, RangeBaseValueChangedEventArgs e)
+    private void Reset_Click(object sender, RoutedEventArgs e)
     {
-        if (_loading || StartLabel == null || EndLabel == null) return;
-        if (EndSlider.Value < StartSlider.Value + 1)
-        {
-            if (ReferenceEquals(sender, StartSlider)) EndSlider.Value = Math.Min(_duration, StartSlider.Value + 1);
-            else StartSlider.Value = Math.Max(0, Math.Floor(EndSlider.Value - 1));
-        }
+        _videoBar.Reset(_duration);
+        foreach (var t in _tracks) t.Bar.Reset(_duration);
         UpdateTrimLabels();
     }
-
-    private void StartHere_Click(object sender, RoutedEventArgs e) => StartSlider.Value = Math.Floor(Position.TotalSeconds);
-
-    private void EndHere_Click(object sender, RoutedEventArgs e) => EndSlider.Value = Math.Round(Position.TotalSeconds, 1);
 
     private void PlaySelection_Click(object sender, RoutedEventArgs e)
     {
         if (Player.MediaPlayer == null) return;
-        Position = TimeSpan.FromSeconds(StartSlider.Value);
+        Position = TimeSpan.FromSeconds(_videoBar.Start);
         _playingSelection = true;
         Player.MediaPlayer.Play();
     }
 
     private void Timer_Tick(object? sender, object e)
     {
-        if (!_playingSelection || Player.MediaPlayer == null) return;
-        if (Position.TotalSeconds >= EndSlider.Value)
+        if (Player.MediaPlayer == null || _clipPath == null) return;
+        double now = Position.TotalSeconds;
+        _videoBar.SetPlayhead(now);
+        foreach (var t in _tracks) t.Bar.SetPlayhead(now);
+        if (_playingSelection && now >= _videoBar.End)
         {
             Player.MediaPlayer.Pause();
             _playingSelection = false;
@@ -223,13 +249,13 @@ public sealed partial class EditorPage : Page
         var args = new List<string>
         {
             "--edit", source, "--out", output,
-            "--start", ((long)(StartSlider.Value * 1000)).ToString(CultureInfo.InvariantCulture),
-            "--end", ((long)(EndSlider.Value * 1000)).ToString(CultureInfo.InvariantCulture),
+            "--start", ((long)(_videoBar.Start * 1000)).ToString(CultureInfo.InvariantCulture),
+            "--end", ((long)(_videoBar.End * 1000)).ToString(CultureInfo.InvariantCulture),
         };
         foreach (var t in _tracks)
         {
-            double start = double.IsNaN(t.Start.Value) ? 0 : t.Start.Value;
-            double end = double.IsNaN(t.End.Value) ? _duration : t.End.Value;
+            double start = t.Bar.Start;
+            double end = t.Bar.End;
             args.Add("--atrack");
             args.Add(string.Format(CultureInfo.InvariantCulture, "{0}:{1}:{2}:{3}:{4}", t.Number, t.Keep.IsChecked == true ? 1 : 0,
                                    (long)(start * 1000), (long)(end * 1000), (int)t.Volume.Value));

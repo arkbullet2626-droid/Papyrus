@@ -25,34 +25,17 @@
                 <!-- Clip length -->
                 <Border Style="{StaticResource CardBorderStyle}">
                     <StackPanel Spacing="8">
-                        <TextBlock Text="Clip length" Style="{StaticResource BodyStrongTextBlockStyle}" />
-                        <Grid ColumnSpacing="12">
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="60" />
-                                <ColumnDefinition Width="*" />
-                                <ColumnDefinition Width="70" />
-                                <ColumnDefinition Width="Auto" />
-                            </Grid.ColumnDefinitions>
-                            <Grid.RowDefinitions>
-                                <RowDefinition Height="Auto" />
-                                <RowDefinition Height="Auto" />
-                            </Grid.RowDefinitions>
-                            <TextBlock Text="Start" VerticalAlignment="Center" />
-                            <Slider x:Name="StartSlider" Grid.Column="1" Minimum="0" Maximum="1" StepFrequency="1" ValueChanged="Trim_ValueChanged" IsEnabled="False" />
-                            <TextBlock x:Name="StartLabel" Grid.Column="2" Text="0:00.0" VerticalAlignment="Center" />
-                            <Button x:Name="StartHereButton" Grid.Column="3" Content="Start at current position" Click="StartHere_Click" IsEnabled="False" />
-
-                            <TextBlock Grid.Row="1" Text="End" VerticalAlignment="Center" />
-                            <Slider x:Name="EndSlider" Grid.Row="1" Grid.Column="1" Minimum="0" Maximum="1" StepFrequency="0.1" ValueChanged="Trim_ValueChanged" IsEnabled="False" />
-                            <TextBlock x:Name="EndLabel" Grid.Row="1" Grid.Column="2" Text="0:00.0" VerticalAlignment="Center" />
-                            <Button x:Name="EndHereButton" Grid.Row="1" Grid.Column="3" Content="End at current position" Click="EndHere_Click" IsEnabled="False" />
+                        <Grid>
+                            <TextBlock Text="Clip" Style="{StaticResource BodyStrongTextBlockStyle}" VerticalAlignment="Center" />
+                            <TextBlock x:Name="LengthLabel" Text="" HorizontalAlignment="Right" VerticalAlignment="Center" />
                         </Grid>
+                        <Grid x:Name="VideoBarHost" />
                         <StackPanel Orientation="Horizontal" Spacing="12">
                             <Button x:Name="PlaySelectionButton" Content="Play the selected part" Click="PlaySelection_Click" IsEnabled="False" />
-                            <TextBlock x:Name="LengthLabel" Text="" VerticalAlignment="Center" />
+                            <Button x:Name="ResetButton" Content="Reset" Click="Reset_Click" IsEnabled="False" />
                         </StackPanel>
                         <TextBlock Style="{StaticResource CaptionStyle}"
-                                   Text="The start moves in 1-second steps so the picture can be copied without losing any quality. The end can be anywhere." />
+                                   Text="Drag the bar on each side to cut the clip. The left bar moves in 1-second steps so the picture can be copied without losing any quality. Click anywhere on a strip to jump there." />
                     </StackPanel>
                 </Border>
 
@@ -61,9 +44,9 @@
                     <StackPanel Spacing="8">
                         <TextBlock Text="Sound tracks" Style="{StaticResource BodyStrongTextBlockStyle}" />
                         <TextBlock x:Name="NoTracksLabel" Text="This clip has no sound." Style="{StaticResource CaptionStyle}" />
-                        <StackPanel x:Name="TracksPanel" Spacing="10" />
+                        <StackPanel x:Name="TracksPanel" Spacing="16" />
                         <TextBlock Style="{StaticResource CaptionStyle}"
-                                   Text="Listen picks which track you hear while previewing. Untick Keep to leave a track out of the saved clip. Start and end are in seconds from the beginning of the original clip. Changing the volume re-encodes that track only." />
+                                   Text="Each strip shows how loud that track is over time. Drag its side bars to choose when the track is heard. Listen picks which track you hear while previewing; untick Keep to leave a track out of the saved clip. Changing the volume re-encodes that track only." />
                     </StackPanel>
                 </Border>
 

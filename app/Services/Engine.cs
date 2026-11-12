@@ -64,6 +64,31 @@ public static class Engine
         catch { return "unknown error"; }
     }
 
+    /// <summary>Loudness outline of every sound track, for the editor's waveforms. Empty if it cannot be made.</summary>
+    public static async Task<Dictionary<int, byte[]>> PeaksAsync(string clipPath)
+    {
+        var result = new Dictionary<int, byte[]>();
+        try
+        {
+            Directory.CreateDirectory(DataDir);
+            string f = Path.Combine(DataDir, "studio-peaks.txt");
+            try { File.Delete(f); } catch { }
+            if (await RunAsync(new[] { "--peaks", clipPath, "--out", f }) != 0 || !File.Exists(f)) return result;
+            foreach (string line in File.ReadAllLines(f))
+            {
+                if (!line.StartsWith("track=", StringComparison.Ordinal)) continue;
+                int bar = line.IndexOf('|');
+                if (bar < 0 || !int.TryParse(line[6..bar], out int track)) continue;
+                string hex = line[(bar + 1)..];
+                var data = new byte[hex.Length / 2];
+                for (int i = 0; i < data.Length; i++) data[i] = Convert.ToByte(hex.Substring(i * 2, 2), 16);
+                result[track] = data;
+            }
+        }
+        catch { /* the editor works without waveforms */ }
+        return result;
+    }
+
     // --- The tray program ------------------------------------------------------------------------------------
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern IntPtr FindWindowW(string? cls, string? title);
     [DllImport("user32.dll")] private static extern bool PostMessageW(IntPtr hwnd, uint msg, IntPtr wp, IntPtr lp);
