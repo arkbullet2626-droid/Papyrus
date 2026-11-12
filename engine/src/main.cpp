@@ -35,6 +35,7 @@
 #include "ring.h"
 #include "tier.h"
 #include "audio.h"
+#include "edit.h"
 #include "control.h"
 #include "../../third_party/nv-codec-headers/nvEncodeAPI.h"
 
@@ -136,6 +137,11 @@ struct Settings {
     bool     child       = false;   // hidden worker started by the control window
     bool     tray        = false;   // control window: start hidden in the tray
     DWORD    parentPid   = 0;
+    // Clip editor jobs, run by the Studio app
+    wchar_t  infoIn[MAX_PATH] = L"";   // --info FILE: describe a clip into --out
+    wchar_t  editIn[MAX_PATH] = L"";   // --edit FILE: trim a clip into --out
+    long long editStart  = 0, editEnd = -1;
+    edit::TrackEdit edits[4];
     DWORD    gamePid     = 0;       // worker: process whose sound becomes the "Game" track
     bool     mic         = false;   // also record the default microphone as its own track
     bool     noAudio     = false;
@@ -1271,7 +1277,7 @@ int wmain(int argc, wchar_t** argv) {
     // the control window and the hidden worker never open one.
     bool wantConsole = false, isChild = false;
     for (int i = 1; i < argc; i++) {
-        if (!wcscmp(argv[i], L"--child")) isChild = true;
+        if (!wcscmp(argv[i], L"--child") || !wcscmp(argv[i], L"--info") || !wcscmp(argv[i], L"--edit")) isChild = true;   // no console for background jobs
         else if (wcscmp(argv[i], L"--tray") && wcscmp(argv[i], L"--open-clips")) wantConsole = true;
     }
     if (wantConsole && !isChild && (AttachConsole(ATTACH_PARENT_PROCESS) || AllocConsole())) {
@@ -1301,6 +1307,17 @@ int wmain(int argc, wchar_t** argv) {
         else if (is(L"--game-pid")) g_cfg.gamePid = (DWORD)num(1, 0x7fffffff);
         else if (is(L"--mic")) g_cfg.mic = true;
         else if (is(L"--no-audio")) g_cfg.noAudio = true;
+        else if (is(L"--info") && i + 1 < argc) wcsncpy(g_cfg.infoIn, argv[++i], MAX_PATH - 1);
+        else if (is(L"--edit") && i + 1 < argc) wcsncpy(g_cfg.editIn, argv[++i], MAX_PATH - 1);
+        else if (is(L"--start") && i + 1 < argc) g_cfg.editStart = _wtoi64(argv[++i]);
+        else if (is(L"--end") && i + 1 < argc) g_cfg.editEnd = _wtoi64(argv[++i]);
+        else if (is(L"--atrack") && i + 1 < argc) {                       // N:keep:startMs:endMs:volumePercent
+            int n = 0, keep = 1, gain = 100;
+            long long a = 0, b = -1;
+            if (swscanf(argv[++i], L"%d:%d:%lld:%lld:%d", &n, &keep, &a, &b, &gain) == 5 && n >= 1 && n <= 4) {
+                g_cfg.edits[n - 1].keep = keep != 0; g_cfg.edits[n - 1].startMs = a; g_cfg.edits[n - 1].endMs = b; g_cfg.edits[n - 1].gainPercent = gain;
+            }
+        }
         else if (is(L"--height")) g_cfg.height = num(240, 4320);
         else if (is(L"--parent")) g_cfg.parentPid = (DWORD)num(1, 0x7fffffff);
         else if (is(L"--clip")) { g_cfg.clip = num(5, 300); }
@@ -1351,6 +1368,24 @@ int wmain(int argc, wchar_t** argv) {
     CreateDirectoryW(logDir, nullptr);
     wcscpy(g_outDir, outDir);
     if (!dataDir[0]) wcscpy(dataDir, logDir);
+
+    // Clip editor jobs for the Studio app: no window, result in the exit code, any error text in last-edit-error.txt.
+    if (g_cfg.infoIn[0] || g_cfg.editIn[0]) {
+        wchar_t errPath[MAX_PATH];
+        swprintf(errPath, MAX_PATH, L"%ls\\last-edit-error.txt", dataDir);
+        DeleteFileW(errPath);
+        std::string err;
+        bool ok;
+        if (g_cfg.infoIn[0]) ok = edit::writeInfo(g_cfg.infoIn, g_cfg.out, err);
+        else {
+            aud::g_cfg.qpcFreq = g_qpf;
+            int64_t actual = 0;
+            ok = edit::trim(g_cfg.editIn, g_cfg.out, g_cfg.editStart, g_cfg.editEnd, g_cfg.edits, 4, aud::regain, &actual, err);
+            if (!ok) DeleteFileW(g_cfg.out);
+        }
+        if (!ok) writeSmallFile(errPath, err.c_str());
+        return ok ? 0 : 1;
+    }
 
     // No mode given: this is the control window (tray icon + switches). It starts the worker on demand.
     if (!g_cfg.replay && !g_cfg.record && !g_cfg.bench && !g_cfg.list && !g_cfg.openClips) {

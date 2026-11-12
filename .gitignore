@@ -1,2 +1,5 @@
 dist/
+publish/
 *.zip
+bin/
+obj/

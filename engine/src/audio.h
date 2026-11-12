@@ -26,6 +26,7 @@
 #include <tlhelp32.h>
 #include <cstdint>
 #include <cstring>
+#include <vector>
 
 #ifndef AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
 #define AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM 0x80000000
@@ -420,6 +421,137 @@ static void stop() {
     WaitForSingleObject(g_thread, 3000);
     CloseHandle(g_thread);
     g_thread = nullptr;
+}
+
+// --- Volume change for the clip editor ---------------------------------------------------------------------------
+// Decodes AAC frames, scales the samples, encodes them again. Runs once per edited track; allowed to allocate.
+DEFINE_GUID(kAacDecoderClsid, 0x32d186a7, 0x218f, 0x4c75, 0x88, 0x76, 0xdd, 0x77, 0x27, 0x3a, 0x89, 0x99);   // Microsoft AAC decoder
+
+static std::vector<std::vector<uint8_t>>* g_regainOut = nullptr;
+static void regainCollect(int, const uint8_t* data, uint32_t size, int64_t) { g_regainOut->emplace_back(data, data + size); }
+
+static bool regain(const std::vector<std::vector<uint8_t>>& in, int gainPercent, std::vector<std::vector<uint8_t>>& out, uint32_t* extraDelay) {
+    const bool com = SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED));
+    if (FAILED(MFStartup(MF_VERSION, MFSTARTUP_LITE))) { if (com) CoUninitialize(); return false; }
+    bool ok = false;
+    std::vector<int16_t> pcm;
+    IMFTransform* dec = nullptr;
+    IMFMediaType* it = nullptr;
+    IMFMediaType* ot = nullptr;
+    if (SUCCEEDED(CoCreateInstance(kAacDecoderClsid, nullptr, CLSCTX_INPROC_SERVER, __uuidof(IMFTransform), (void**)&dec)) &&
+        SUCCEEDED(MFCreateMediaType(&it)) && SUCCEEDED(MFCreateMediaType(&ot))) {
+        // HEAACWAVEINFO tail (payload type raw, AAC-LC) followed by the AudioSpecificConfig for AAC-LC 48 kHz stereo
+        static const uint8_t user[14] = { 0, 0, 0x29, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x11, 0x90 };
+        it->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+        it->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_AAC);
+        it->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, RATE);
+        it->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, CH);
+        it->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
+        it->SetUINT32(MF_MT_AAC_PAYLOAD_TYPE, 0);
+        it->SetUINT32(MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION, 0x29);
+        it->SetBlob(MF_MT_USER_DATA, user, sizeof user);
+        ot->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+        ot->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_PCM);
+        ot->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
+        ot->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, RATE);
+        ot->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, CH);
+        ot->SetUINT32(MF_MT_AUDIO_BLOCK_ALIGNMENT, CH * 2);
+        ot->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, RATE * CH * 2);
+        if (SUCCEEDED(dec->SetInputType(0, it, 0)) && SUCCEEDED(dec->SetOutputType(0, ot, 0))) {
+            MFT_OUTPUT_STREAM_INFO osi{};
+            dec->GetOutputStreamInfo(0, &osi);
+            const bool decAllocates = (osi.dwFlags & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES)) != 0;
+            const DWORD outSize = osi.cbSize > 65536 ? osi.cbSize : 65536;
+            dec->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
+            dec->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+            auto drain = [&]() {
+                for (int guard = 0; guard < 16; guard++) {
+                    MFT_OUTPUT_DATA_BUFFER o{};
+                    IMFSample* s = nullptr;
+                    IMFMediaBuffer* b = nullptr;
+                    if (!decAllocates) {
+                        if (FAILED(MFCreateSample(&s)) || FAILED(MFCreateMemoryBuffer(outSize, &b))) { if (s) s->Release(); return; }
+                        s->AddBuffer(b);
+                        o.pSample = s;
+                    }
+                    DWORD st = 0;
+                    const HRESULT hr = dec->ProcessOutput(0, 1, &o, &st);
+                    if (o.pEvents) o.pEvents->Release();
+                    if (SUCCEEDED(hr) && o.pSample) {
+                        IMFMediaBuffer* all = nullptr;
+                        if (SUCCEEDED(o.pSample->ConvertToContiguousBuffer(&all))) {
+                            BYTE* p = nullptr;
+                            DWORD len = 0;
+                            if (SUCCEEDED(all->Lock(&p, nullptr, &len))) {
+                                const size_t n = len / 2;
+                                const size_t at = pcm.size();
+                                pcm.resize(at + n);
+                                memcpy(pcm.data() + at, p, n * 2);
+                                all->Unlock();
+                            }
+                            all->Release();
+                        }
+                    }
+                    if (decAllocates && o.pSample) o.pSample->Release();
+                    if (b) b->Release();
+                    if (s) s->Release();
+                    if (FAILED(hr)) return;
+                }
+            };
+            LONGLONG ts = 0;
+            for (const auto& pkt : in) {
+                IMFSample* s = nullptr;
+                IMFMediaBuffer* b = nullptr;
+                if (FAILED(MFCreateSample(&s)) || FAILED(MFCreateMemoryBuffer((DWORD)pkt.size(), &b))) { if (s) s->Release(); break; }
+                BYTE* p = nullptr;
+                if (SUCCEEDED(b->Lock(&p, nullptr, nullptr))) { memcpy(p, pkt.data(), pkt.size()); b->Unlock(); }
+                b->SetCurrentLength((DWORD)pkt.size());
+                s->AddBuffer(b);
+                s->SetSampleTime(ts);
+                s->SetSampleDuration(kFrameTime);
+                ts += kFrameTime;
+                HRESULT hr = dec->ProcessInput(0, s, 0);
+                if (hr == MF_E_NOTACCEPTING) { drain(); hr = dec->ProcessInput(0, s, 0); }
+                b->Release();
+                s->Release();
+                drain();
+            }
+            dec->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
+            drain();
+        }
+    }
+    if (it) it->Release();
+    if (ot) ot->Release();
+    if (dec) dec->Release();
+
+    const size_t expected = in.size() * FRAME * CH;
+    if (!pcm.empty() && pcm.size() <= expected) {
+        const size_t missingFrames = (expected - pcm.size()) / CH;             // some decoders drop their own run-in
+        for (int16_t& v : pcm) {
+            long x = (long)v * gainPercent / 100;
+            v = (int16_t)(x > 32767 ? 32767 : x < -32768 ? -32768 : x);
+        }
+        Track enc;
+        const PacketFn savedFn = g_cfg.onPacket;
+        g_cfg.onPacket = regainCollect;
+        g_regainOut = &out;
+        if (createEncoder(enc)) {
+            const uint32_t frames = (uint32_t)(pcm.size() / CH);
+            feed(enc, 0, pcm.data(), frames, 0);
+            if (enc.fill) feed(enc, 0, nullptr, FRAME - enc.fill, 0);                // pad the last block with silence
+            feed(enc, 0, nullptr, FRAME, 0);                                         // one more block pushes the tail out
+            enc.enc->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
+            drainEncoder(enc, 0);
+            ok = !out.empty();
+            *extraDelay = missingFrames < FRAME ? (uint32_t)(FRAME - missingFrames) : 0;   // the encoder adds one frame of delay
+        }
+        closeTrack(enc);
+        g_cfg.onPacket = savedFn;
+        g_regainOut = nullptr;
+    }
+    MFShutdown();
+    if (com) CoUninitialize();
+    return ok;
 }
 
 } // namespace aud

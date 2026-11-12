@@ -38,17 +38,23 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription:
 
 [Files]
 Source: "..\dist\papyrus-engine.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\dist\studio\*"; DestDir: "{app}\studio"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\README.md"; DestDir: "{app}"; DestName: "README.txt"; Flags: ignoreversion
 Source: "..\LICENSE"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreversion
 Source: "..\third_party\nv-codec-headers\LICENSE.txt"; DestDir: "{app}"; DestName: "THIRD-PARTY-LICENSES.txt"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\Papyrus"; Filename: "{app}\papyrus-engine.exe"; WorkingDir: "{app}"; Comment: "Open Papyrus and switch the replay buffer on or off."
+Name: "{group}\Papyrus Studio"; Filename: "{app}\studio\papyrus-studio.exe"; WorkingDir: "{app}\studio"; Comment: "Watch, trim and edit your clips."
 Name: "{group}\Papyrus clips folder"; Filename: "{app}\papyrus-engine.exe"; Parameters: "--open-clips"; WorkingDir: "{app}"
 Name: "{group}\Papyrus self-test"; Filename: "{app}\papyrus-engine.exe"; Parameters: "--replay --seconds 45 --autosave 40 --pause"; WorkingDir: "{app}"; Comment: "Runs for 45 seconds and saves one clip by itself."
 Name: "{group}\Papyrus 4K benchmark"; Filename: "{app}\papyrus-engine.exe"; Parameters: "--bench4k --pause"; WorkingDir: "{app}"
 Name: "{group}\Uninstall Papyrus"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\Papyrus"; Filename: "{app}\papyrus-engine.exe"; WorkingDir: "{app}"; Tasks: desktopicon
+
+[InstallDelete]
+; Remove the previous Studio files so an update never leaves stale ones behind.
+Type: filesandordirs; Name: "{app}\studio"
 
 [Registry]
 ; "Always on" adds this value from inside Papyrus; make sure uninstalling removes it.
