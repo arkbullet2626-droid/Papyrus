@@ -33,6 +33,7 @@
 #include "wgc_abi.h"
 #include "mp4.h"
 #include "ring.h"
+#include "tier.h"
 #include "control.h"
 #include "../../third_party/nv-codec-headers/nvEncodeAPI.h"
 
@@ -134,6 +135,8 @@ struct Settings {
     bool     child       = false;   // hidden worker started by the control window
     bool     tray        = false;   // control window: start hidden in the tray
     DWORD    parentPid   = 0;
+    bool     noHotkey    = false;   // worker: the control window owns the hotkey
+    int      height      = 0;       // wanted clip height (2160/1440/1080/720/480), 0 = same as the screen
     wchar_t  out[MAX_PATH] = L"";
 };
 static Settings g_cfg;
@@ -435,7 +438,7 @@ static void startCapture() {
     wgc::SizeInt32 size{};
     hrcheck(g_item->get_Size(&size), "GraphicsCaptureItem.Size");
     g_srcW = (uint32_t)size.Width;  g_srcH = (uint32_t)size.Height;
-    g_encW = g_srcW & ~1u;          g_encH = g_srcH & ~1u;
+    papyrusEncodeSize(g_srcW, g_srcH, (uint32_t)g_cfg.height, &g_encW, &g_encH);    // downscale on the GPU, never upscale
 
     // Wrap our D3D11 device for WinRT
     IDXGIDevice* dxgiDev = nullptr;
@@ -1072,12 +1075,7 @@ static void runBench4k() {
 // Quality ladder (docs/SPEC.md section 8) and preset choice, used when the user did not set them by hand.
 static void applyAutoTier() {
     const uint64_t px = (uint64_t)g_encW * g_encH;
-    const bool hi = g_cfg.fps > 60;
-    if (!g_cfg.bitrateSet) {
-        if (px > 2560ull * 1440 * 11 / 10)      { g_cfg.bitrateMbps = hi ? 100 : 60; g_cfg.maxrateMbps = hi ? 150 : 90; }
-        else if (px > 1920ull * 1080 * 11 / 10) { g_cfg.bitrateMbps = hi ? 50 : 35;  g_cfg.maxrateMbps = hi ? 75 : 50; }
-        else                                    { g_cfg.bitrateMbps = hi ? 30 : 20;  g_cfg.maxrateMbps = hi ? 45 : 30; }
-    }
+    if (!g_cfg.bitrateSet) papyrusTier(px, g_cfg.fps, &g_cfg.bitrateMbps, &g_cfg.maxrateMbps);
     // Measured on an RTX 5070: above 1440p120 only P3 leaves the 30 % safety margin (see the 4K benchmark).
     if (g_cfg.preset == 0) g_cfg.preset = (px * (uint64_t)g_cfg.fps > 2560ull * 1440 * 120 * 12 / 10) ? 3 : 4;
 }
@@ -1208,6 +1206,7 @@ static void usage() {
            " Common options\n"
            "  --seconds N    how long to run (record: default 60; replay: default until Ctrl+C)\n"
            "  --fps N        frames per second (default 120)\n"
+           "  --height N     clip height, e.g. 1080; scaled down on the GPU, never up (default: same as the screen)\n"
            "  --bitrate N    target bitrate in Mbps (default: from the quality ladder for the resolution)\n"
            "  --maxrate N    maximum bitrate in Mbps\n"
            "  --preset N     NVENC preset 3, 4 or 5 (default: P3 above 1440p120, otherwise P4)\n"
@@ -1259,6 +1258,8 @@ int wmain(int argc, wchar_t** argv) {
         else if (is(L"--record")) g_cfg.record = true;
         else if (is(L"--child")) g_cfg.child = true;
         else if (is(L"--tray")) g_cfg.tray = true;
+        else if (is(L"--no-hotkey")) g_cfg.noHotkey = true;
+        else if (is(L"--height")) g_cfg.height = num(240, 4320);
         else if (is(L"--parent")) g_cfg.parentPid = (DWORD)num(1, 0x7fffffff);
         else if (is(L"--clip")) { g_cfg.clip = num(5, 300); }
         else if (is(L"--autosave")) g_cfg.autosave = num(1, 24 * 3600);
@@ -1313,7 +1314,7 @@ int wmain(int argc, wchar_t** argv) {
     if (!g_cfg.replay && !g_cfg.record && !g_cfg.bench && !g_cfg.list && !g_cfg.openClips) {
         wchar_t ver[64];
         swprintf(ver, 64, L"version %hs", PAPYRUS_VER);
-        return ctl::run(g_cfg.tray, outDir, dataDir, ver, g_cfg.hkText);
+        return ctl::run(g_cfg.tray, outDir, dataDir, ver);
     }
     if (g_cfg.child) {
         swprintf(g_errPath, MAX_PATH, L"%ls\\last-error.txt", dataDir);
@@ -1370,7 +1371,7 @@ int wmain(int argc, wchar_t** argv) {
 
     if (g_cfg.replay) {
         // One slab for the whole buffer, allocated once: (clip + 2 s spare) at the target bitrate plus 15 % headroom.
-        g_slabBytes = (uint64_t)g_cfg.bitrateMbps * 1000000ull / 8 * (uint64_t)(g_cfg.clip + 2) * 115 / 100;
+        g_slabBytes = papyrusSlabBytes(g_cfg.bitrateMbps, g_cfg.clip);
         uint8_t* slab = (uint8_t*)VirtualAlloc(nullptr, (SIZE_T)g_slabBytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         if (!slab) fatal("Could not allocate the %llu MB replay buffer. Choose a shorter --clip.", (unsigned long long)(g_slabBytes >> 20));
         const uint64_t maxPkts = (uint64_t)(g_cfg.clip + 6) * (uint64_t)g_cfg.fps;
@@ -1401,6 +1402,7 @@ int wmain(int argc, wchar_t** argv) {
     logf("  Graphics card : %ls\n", g_adapterName);
     logf("  NVENC API     : driver %u.%u, app %d.%d, %s mode\n", g_driverNvencVer >> 4, g_driverNvencVer & 0xF,
          NVENCAPI_MAJOR_VERSION, NVENCAPI_MINOR_VERSION, g_async ? "async" : "sync");
+    if (g_encW != g_srcW || g_encH != g_srcH) logf("  Scaling       : %ux%u -> %ux%u on the GPU\n", g_srcW, g_srcH, g_encW, g_encH);
     logf("  Capture       : Windows Graphics Capture, monitor %ux%u, border %s, min-interval %s, cursor %s\n",
          g_srcW, g_srcH, g_borderOff ? "off" : "on (not supported here)", g_minIntervalSet ? "set" : "not available",
          g_cfg.cursor ? "on" : "off");
@@ -1420,13 +1422,11 @@ int wmain(int argc, wchar_t** argv) {
 
     bool hotkeyOk = false;
     if (g_cfg.replay) {
-        hotkeyOk = RegisterHotKey(nullptr, 1, g_cfg.hkMods | MOD_NOREPEAT, g_cfg.hkVk) != 0;
+        hotkeyOk = g_cfg.noHotkey || RegisterHotKey(nullptr, 1, g_cfg.hkMods | MOD_NOREPEAT, g_cfg.hkVk) != 0;
         if (g_cfg.child) {
-            char st[400];
-            if (hotkeyOk) snprintf(st, sizeof st, "Recording %ux%u at %d fps. Press %ls to save the last %d seconds (high beep = saved).",
-                                   g_encW, g_encH, g_cfg.fps, g_cfg.hkText, g_cfg.clip);
-            else snprintf(st, sizeof st, "Recording %ux%u at %d fps, but another program already uses %ls. Use the \"Save clip now\" button instead.",
-                          g_encW, g_encH, g_cfg.fps, g_cfg.hkText);
+            char st[200];
+            if (g_encW != g_srcW || g_encH != g_srcH) snprintf(st, sizeof st, "Recording %ux%u (scaled down from %ux%u) at %d fps.", g_encW, g_encH, g_srcW, g_srcH, g_cfg.fps);
+            else snprintf(st, sizeof st, "Recording %ux%u at %d fps.", g_encW, g_encH, g_cfg.fps);
             writeSmallFile(g_statPath, st);
         }
         if (!hotkeyOk)
