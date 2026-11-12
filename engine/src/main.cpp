@@ -140,6 +140,7 @@ struct Settings {
     // Clip editor jobs, run by the Studio app
     wchar_t  infoIn[MAX_PATH] = L"";   // --info FILE: describe a clip into --out
     wchar_t  editIn[MAX_PATH] = L"";   // --edit FILE: trim a clip into --out
+    wchar_t  peaksIn[MAX_PATH] = L"";  // --peaks FILE: write each sound track's loudness outline into --out
     long long editStart  = 0, editEnd = -1;
     edit::TrackEdit edits[4];
     DWORD    gamePid     = 0;       // worker: process whose sound becomes the "Game" track
@@ -1277,7 +1278,7 @@ int wmain(int argc, wchar_t** argv) {
     // the control window and the hidden worker never open one.
     bool wantConsole = false, isChild = false;
     for (int i = 1; i < argc; i++) {
-        if (!wcscmp(argv[i], L"--child") || !wcscmp(argv[i], L"--info") || !wcscmp(argv[i], L"--edit")) isChild = true;   // no console for background jobs
+        if (!wcscmp(argv[i], L"--child") || !wcscmp(argv[i], L"--info") || !wcscmp(argv[i], L"--edit") || !wcscmp(argv[i], L"--peaks")) isChild = true;   // no console for background jobs
         else if (wcscmp(argv[i], L"--tray") && wcscmp(argv[i], L"--open-clips")) wantConsole = true;
     }
     if (wantConsole && !isChild && (AttachConsole(ATTACH_PARENT_PROCESS) || AllocConsole())) {
@@ -1309,6 +1310,7 @@ int wmain(int argc, wchar_t** argv) {
         else if (is(L"--no-audio")) g_cfg.noAudio = true;
         else if (is(L"--info") && i + 1 < argc) wcsncpy(g_cfg.infoIn, argv[++i], MAX_PATH - 1);
         else if (is(L"--edit") && i + 1 < argc) wcsncpy(g_cfg.editIn, argv[++i], MAX_PATH - 1);
+        else if (is(L"--peaks") && i + 1 < argc) wcsncpy(g_cfg.peaksIn, argv[++i], MAX_PATH - 1);
         else if (is(L"--start") && i + 1 < argc) g_cfg.editStart = _wtoi64(argv[++i]);
         else if (is(L"--end") && i + 1 < argc) g_cfg.editEnd = _wtoi64(argv[++i]);
         else if (is(L"--atrack") && i + 1 < argc) {                       // N:keep:startMs:endMs:volumePercent
@@ -1370,13 +1372,14 @@ int wmain(int argc, wchar_t** argv) {
     if (!dataDir[0]) wcscpy(dataDir, logDir);
 
     // Clip editor jobs for the Studio app: no window, result in the exit code, any error text in last-edit-error.txt.
-    if (g_cfg.infoIn[0] || g_cfg.editIn[0]) {
+    if (g_cfg.infoIn[0] || g_cfg.editIn[0] || g_cfg.peaksIn[0]) {
         wchar_t errPath[MAX_PATH];
         swprintf(errPath, MAX_PATH, L"%ls\\last-edit-error.txt", dataDir);
         DeleteFileW(errPath);
         std::string err;
         bool ok;
         if (g_cfg.infoIn[0]) ok = edit::writeInfo(g_cfg.infoIn, g_cfg.out, err);
+        else if (g_cfg.peaksIn[0]) ok = edit::writePeaks(g_cfg.peaksIn, g_cfg.out, 800, aud::decodeTrack, err);
         else {
             aud::g_cfg.qpcFreq = g_qpf;
             int64_t actual = 0;

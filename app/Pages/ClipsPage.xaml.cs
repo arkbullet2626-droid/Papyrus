@@ -133,7 +133,6 @@ public sealed partial class ClipsPage : Page
             VerticalContentAlignment = VerticalAlignment.Top,
             Tag = card,
         };
-        ToolTipService.SetToolTip(button, "Click to open in the editor");
         button.Click += Card_Click;
         button.PointerEntered += Card_PointerEntered;
         button.PointerExited += Card_PointerExited;

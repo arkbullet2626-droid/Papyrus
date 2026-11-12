@@ -427,14 +427,8 @@ static void stop() {
 // Decodes AAC frames, scales the samples, encodes them again. Runs once per edited track; allowed to allocate.
 DEFINE_GUID(kAacDecoderClsid, 0x32d186a7, 0x218f, 0x4c75, 0x88, 0x76, 0xdd, 0x77, 0x27, 0x3a, 0x89, 0x99);   // Microsoft AAC decoder
 
-static std::vector<std::vector<uint8_t>>* g_regainOut = nullptr;
-static void regainCollect(int, const uint8_t* data, uint32_t size, int64_t) { g_regainOut->emplace_back(data, data + size); }
-
-static bool regain(const std::vector<std::vector<uint8_t>>& in, int gainPercent, std::vector<std::vector<uint8_t>>& out, uint32_t* extraDelay) {
-    const bool com = SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED));
-    if (FAILED(MFStartup(MF_VERSION, MFSTARTUP_LITE))) { if (com) CoUninitialize(); return false; }
-    bool ok = false;
-    std::vector<int16_t> pcm;
+// Decodes raw AAC-LC frames (48 kHz stereo) to 16-bit PCM. Media Foundation must already be started.
+static bool decodeAac(const std::vector<std::vector<uint8_t>>& in, std::vector<int16_t>& pcm) {
     IMFTransform* dec = nullptr;
     IMFMediaType* it = nullptr;
     IMFMediaType* ot = nullptr;
@@ -523,6 +517,32 @@ static bool regain(const std::vector<std::vector<uint8_t>>& in, int gainPercent,
     if (it) it->Release();
     if (ot) ot->Release();
     if (dec) dec->Release();
+    return !pcm.empty();
+}
+
+// For the editor's waveforms: decode a whole track. *missingFrames = frames the decoder dropped at the very start.
+static bool decodeTrack(const std::vector<std::vector<uint8_t>>& in, std::vector<int16_t>& pcm, uint32_t* missingFrames) {
+    const bool com = SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED));
+    bool ok = false;
+    if (SUCCEEDED(MFStartup(MF_VERSION, MFSTARTUP_LITE))) {
+        ok = decodeAac(in, pcm);
+        MFShutdown();
+    }
+    if (com) CoUninitialize();
+    const size_t expected = in.size() * FRAME * CH;
+    *missingFrames = ok && pcm.size() < expected ? (uint32_t)((expected - pcm.size()) / CH) : 0;
+    return ok;
+}
+
+static std::vector<std::vector<uint8_t>>* g_regainOut = nullptr;
+static void regainCollect(int, const uint8_t* data, uint32_t size, int64_t) { g_regainOut->emplace_back(data, data + size); }
+
+static bool regain(const std::vector<std::vector<uint8_t>>& in, int gainPercent, std::vector<std::vector<uint8_t>>& out, uint32_t* extraDelay) {
+    const bool com = SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED));
+    if (FAILED(MFStartup(MF_VERSION, MFSTARTUP_LITE))) { if (com) CoUninitialize(); return false; }
+    bool ok = false;
+    std::vector<int16_t> pcm;
+    decodeAac(in, pcm);
 
     const size_t expected = in.size() * FRAME * CH;
     if (!pcm.empty() && pcm.size() <= expected) {
