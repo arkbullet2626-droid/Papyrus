@@ -1,9 +1,13 @@
-// Papyrus - control window and tray icon.
+// Papyrus - the tray program.
 //
-// This is the small always-there part: a tray icon, a tiny window with the switches, and nothing else.
-// The capture/encode pipeline does NOT run in this process. When the replay buffer is switched on, this
-// process starts the same exe again as a hidden worker ("--replay --child"); switching it off asks the worker
-// to exit, which hands every byte of video memory and RAM back to Windows. Plain Win32, no UI framework.
+// This is the small always-there part: a tray icon, the save hotkey, and the decision of when the recorder runs.
+// The capture/encode pipeline does NOT run in this process. When the replay buffer should record, this process
+// starts the same exe again as a hidden worker ("--replay --child"); stopping asks the worker to exit, which
+// hands every byte of video memory and RAM back to Windows.
+//
+// The user interface is the separate Papyrus app (app\Papyrus.exe): it edits settings.ini, then posts
+// WM_CTL_RELOAD / WM_CTL_ARM / WM_CTL_SAVE to this window, and reads state.txt to show what is going on.
+// The small Win32 window in this file is only a fallback for when that app is not installed. Plain Win32.
 #pragma once
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -24,6 +28,7 @@ static const wchar_t* const kMutex     = L"PapyrusControllerMutex";
 
 enum { IDC_TOGGLE = 101, IDC_ALWAYS, IDC_SAVE, IDC_OPEN, IDC_HOTKEY, IDC_LEN, IDC_FPS, IDC_QUAL, IDC_MODE, IDC_MIC, IDM_SHOW = 201, IDM_EXIT, IDM_FOLDER };
 enum { WM_TRAY = WM_APP + 1, WM_SHOWME = WM_APP + 2, TIMER_WATCH = 1 };
+enum { WM_CTL_RELOAD = WM_APP + 10, WM_CTL_ARM = WM_APP + 11, WM_CTL_SAVE = WM_APP + 12 };   // from the Papyrus app
 
 static HWND   g_wnd, g_toggle, g_always, g_save, g_open, g_status, g_hotkey, g_len, g_fps, g_qual, g_est, g_mode, g_micBox;
 
@@ -48,7 +53,7 @@ static const int kHeights[] = { 2160, 1440, 1080, 720, 480 };
 static const wchar_t* const kHeightNames[] = { L"4K (2160p)", L"1440p", L"1080p", L"720p", L"480p" };
 static HANDLE g_worker, g_evStop, g_evSave;
 static bool   g_alwaysOn, g_balloonShown, g_exiting;
-static wchar_t g_out[MAX_PATH], g_ini[MAX_PATH], g_err[MAX_PATH], g_stat[MAX_PATH], g_exe[MAX_PATH];
+static wchar_t g_out[MAX_PATH], g_ini[MAX_PATH], g_err[MAX_PATH], g_stat[MAX_PATH], g_exe[MAX_PATH], g_state[MAX_PATH];
 static wchar_t g_lastStatus[400];
 static HICON  g_icoOn, g_icoOff;
 static HFONT  g_font, g_fontBig;
@@ -174,6 +179,23 @@ static void setTray(DWORD action) {
     Shell_NotifyIconW(action, &g_nid);
 }
 
+// Tells the Papyrus app what is going on: armed, tray state (0 off, 1 waiting, 2 recording) and the status line.
+static void writeState() {
+    static wchar_t last[520] = L"";
+    wchar_t text[520];
+    swprintf(text, 520, L"armed=%d\nstate=%d\nstatus=%ls\n", g_armed ? 1 : 0, !g_armed ? 0 : (workerOn() && !g_paused) ? 2 : 1, g_lastStatus);
+    if (!wcscmp(text, last)) return;
+    wcscpy(last, text);
+    char utf8[1600];
+    const int n = WideCharToMultiByte(CP_UTF8, 0, text, -1, utf8, sizeof utf8, nullptr, nullptr);
+    if (n <= 1) return;
+    HANDLE f = CreateFileW(g_state, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, CREATE_ALWAYS, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    DWORD wr = 0;
+    WriteFile(f, utf8, (DWORD)n - 1, &wr, nullptr);
+    CloseHandle(f);
+}
+
 static void updateUi(const wchar_t* status) {
     SetWindowTextW(g_toggle, g_armed ? L"Replay buffer is ON      (click to turn off)" : L"Replay buffer is OFF      (click to turn on)");
     SendMessageW(g_toggle, BM_SETCHECK, g_armed ? BST_CHECKED : BST_UNCHECKED, 0);
@@ -184,6 +206,7 @@ static void updateUi(const wchar_t* status) {
         SetWindowTextW(g_status, status);
     }
     setTray(NIM_MODIFY);
+    writeState();
 }
 
 // The status line for the current state.
@@ -341,17 +364,20 @@ static void setAlwaysOn(bool on) {
     }
 }
 
-// Opens the Studio app (clip library and editor). Falls back to the clips folder if it is not installed.
-static void openStudio() {
+// Opens the Papyrus app (clips, editor and settings). Returns false if it is not installed.
+static bool openApp() {
     wchar_t path[MAX_PATH];
     wcscpy(path, g_exe);
     if (wchar_t* slash = wcsrchr(path, L'\\')) *slash = 0;
-    wcscat(path, L"\\studio\\papyrus-studio.exe");
-    if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) ShellExecuteW(nullptr, L"open", path, nullptr, nullptr, SW_SHOWNORMAL);
-    else ShellExecuteW(nullptr, L"open", g_out, nullptr, nullptr, SW_SHOWNORMAL);
+    wcscat(path, L"\\app\\Papyrus.exe");
+    if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) return false;
+    ShellExecuteW(nullptr, L"open", path, nullptr, nullptr, SW_SHOWNORMAL);
+    return true;
 }
 
+// "Show Papyrus": the app if it is installed, otherwise the small built-in window.
 static void showWindow() {
+    if (openApp()) return;
     ShowWindow(g_wnd, SW_SHOWNORMAL);
     SetForegroundWindow(g_wnd);
 }
@@ -371,9 +397,8 @@ static void trayMenu() {
     AppendMenuW(m, MF_STRING | (g_alwaysOn ? MF_CHECKED : 0), IDC_ALWAYS, L"Always on (start with Windows)");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING | (workerOn() ? 0 : MF_GRAYED), IDC_SAVE, L"Save clip now");
-    AppendMenuW(m, MF_STRING, IDC_OPEN, L"Clips and editor");
     AppendMenuW(m, MF_STRING, IDM_FOLDER, L"Open clips folder");
-    AppendMenuW(m, MF_STRING, IDM_SHOW, L"Show Papyrus window");
+    AppendMenuW(m, MF_STRING, IDM_SHOW, L"Open Papyrus");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, IDM_EXIT, L"Exit Papyrus");
     POINT pt;
@@ -388,8 +413,24 @@ static LRESULT CALLBACK wndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == g_msgTaskbar && g_msgTaskbar) { setTray(NIM_ADD); return 0; }      // Explorer restarted
     switch (msg) {
     case WM_HOTKEY:
+    case WM_CTL_SAVE:
         if (workerOn()) SetEvent(g_evSave);
         return 0;
+    case WM_CTL_ARM:
+        arm(wp != 0);
+        return 0;
+    case WM_CTL_RELOAD: {                                   // the Papyrus app changed settings.ini
+        const int oldClip = s_clip, oldFps = s_fps, oldHeight = s_height;
+        const bool oldMic = s_mic;
+        const UINT oldVk = s_vk, oldMods = s_mods;
+        loadSettings();
+        const bool always = GetPrivateProfileIntW(L"papyrus", L"always_on", 0, g_ini) != 0;
+        if (always != g_alwaysOn) setAlwaysOn(always);
+        if ((oldVk != s_vk || oldMods != s_mods) && g_armed) registerHotkey(true);
+        if (oldClip != s_clip || oldFps != s_fps || oldHeight != s_height || oldMic != s_mic) { updateEstimate(); stopWorker(); }
+        evaluate();
+        return 0;
+    }
     case WM_COMMAND:
         if (HIWORD(wp) == CBN_SELCHANGE) {
             const int sel = (int)SendMessageW((HWND)lp, CB_GETCURSEL, 0, 0);
@@ -422,7 +463,7 @@ static LRESULT CALLBACK wndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         case IDC_TOGGLE: arm(!g_armed); return 0;
         case IDC_ALWAYS: setAlwaysOn(!g_alwaysOn); updateUi(nullptr); return 0;
         case IDC_SAVE:   if (workerOn()) SetEvent(g_evSave); return 0;
-        case IDC_OPEN:   openStudio(); return 0;
+        case IDC_OPEN:   showWindow(); return 0;
         case IDM_FOLDER: ShellExecuteW(nullptr, L"open", g_out, nullptr, nullptr, SW_SHOWNORMAL); return 0;
         case IDM_SHOW:   showWindow(); return 0;
         case IDM_EXIT:   quit(); return 0;
@@ -464,6 +505,7 @@ static LRESULT CALLBACK wndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             g_nid.uFlags = NIF_INFO;
             wcscpy(g_nid.szInfoTitle, L"Papyrus is still running");
             wcscpy(g_nid.szInfo, L"Click the Papyrus icon near the clock to open it again. Right-click it to exit.");
+            g_nid.szInfo[255] = 0;
             g_nid.dwInfoFlags = NIIF_INFO;
             Shell_NotifyIconW(NIM_MODIFY, &g_nid);
         }
@@ -498,6 +540,7 @@ static int run(bool startHidden, const wchar_t* outDir, const wchar_t* dataDir, 
     swprintf(g_ini, MAX_PATH, L"%ls\\settings.ini", dataDir);
     swprintf(g_err, MAX_PATH, L"%ls\\last-error.txt", dataDir);
     swprintf(g_stat, MAX_PATH, L"%ls\\status.txt", dataDir);
+    swprintf(g_state, MAX_PATH, L"%ls\\state.txt", dataDir);
     GetModuleFileNameW(nullptr, g_exe, MAX_PATH);
     g_alwaysOn = GetPrivateProfileIntW(L"papyrus", L"always_on", 0, g_ini) != 0;
     loadSettings();
@@ -529,7 +572,7 @@ static int run(bool startHidden, const wchar_t* outDir, const wchar_t* dataDir, 
     RECT rc{ 0, 0, S(440), S(632) };
     AdjustWindowRectEx(&rc, style, FALSE, 0);
     const int ww = rc.right - rc.left, wh = rc.bottom - rc.top;
-    g_wnd = CreateWindowExW(0, kWndClass, L"Papyrus", style, (GetSystemMetrics(SM_CXSCREEN) - ww) / 2, (GetSystemMetrics(SM_CYSCREEN) - wh) / 2,
+    g_wnd = CreateWindowExW(0, kWndClass, L"Papyrus recorder", style, (GetSystemMetrics(SM_CXSCREEN) - ww) / 2, (GetSystemMetrics(SM_CYSCREEN) - wh) / 2,
                             ww, wh, nullptr, nullptr, wc.hInstance, nullptr);
     if (!g_wnd) return 1;
 

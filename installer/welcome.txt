@@ -1,16 +1,17 @@
 Papyrus - instant replay for your games
 
-While the replay buffer is on, Papyrus keeps the last 30 seconds of your main monitor in
-memory as compressed video. Press Ctrl+Shift+F9 and those 30 seconds are saved as an .mp4.
+While the replay buffer is on, Papyrus keeps the last 30 seconds of your game in memory as
+compressed video. Press Ctrl+Shift+F9 and those 30 seconds are saved as an .mp4.
 
 After setup:
-  - Open "Papyrus" from the Start menu. The replay buffer starts OFF.
-  - Click the big button to turn the replay buffer on or off.
-  - Tick "Always on" if you want Papyrus to start with Windows with the buffer already on.
-  - Closing the window keeps Papyrus in the tray near the clock. Right-click its icon to exit.
+  - Open "Papyrus" from the Start menu.
+  - Clips shows your clips. Click one to open it in the editor.
+  - Settings has the replay buffer switch (it starts OFF), the hotkey, clip length and quality.
+  - Closing the window does not stop recording: Papyrus stays in the tray near the clock.
+    Right-click its icon to exit.
   - Clips are saved in your Videos\Papyrus folder.
 
-If an older Papyrus is still running in a black window, close that window before you continue.
+Exit any older Papyrus first (right-click its tray icon, Exit Papyrus).
 
 This early version needs an NVIDIA graphics card with a current driver (570 or newer).
 Papyrus makes no network connections and collects nothing.
