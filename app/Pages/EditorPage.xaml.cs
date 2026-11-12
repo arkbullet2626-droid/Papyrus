@@ -21,7 +21,7 @@ public sealed partial class EditorPage : Page
     {
         InitializeComponent();
         _videoBar = new RangeBar(Windows.UI.Color.FromArgb(255, 230, 60, 60), true) { StartStep = 1, MinLength = 1 };
-        _videoBar.RangeChanged += UpdateTrimLabels;
+        _videoBar.RangeChanged += ClipRangeChanged;
         _videoBar.SeekRequested += Seek;
         VideoBarHost.Children.Add(_videoBar);
         _timer.Tick += Timer_Tick;
@@ -55,6 +55,7 @@ public sealed partial class EditorPage : Page
     private bool _playingSelection;
     private bool _loading;
     private RangeBar _videoBar = null!;
+    private double _prevClipStart, _prevClipEnd;        // where the clip bars were before the last move
     private static readonly Windows.UI.Color[] TrackColors =
     {
         Windows.UI.Color.FromArgb(255, 76, 175, 80), Windows.UI.Color.FromArgb(255, 30, 215, 96),
@@ -138,6 +139,7 @@ public sealed partial class EditorPage : Page
 
         _videoBar.Reset(_duration);
         foreach (var t in _tracks) t.Bar.Reset(_duration);
+        SyncTracksToClip();
         UpdateTrimLabels();
 
         _item = new MediaPlaybackItem(MediaSource.CreateFromUri(new Uri(path)));
@@ -202,6 +204,42 @@ public sealed partial class EditorPage : Page
     // ---------------------------------------------------------------------------------------------------------
     // Trimming
     // ---------------------------------------------------------------------------------------------------------
+    /// <summary>
+    /// The clip bars moved. A sound-track bar that was sitting on a clip bar moves with it, so tracks stay the same
+    /// length as the clip unless they were shortened on purpose. No track may reach outside the clip.
+    /// </summary>
+    private void ClipRangeChanged()
+    {
+        double start = _videoBar.Start, end = _videoBar.End;
+        foreach (var t in _tracks)
+        {
+            double ts = t.Bar.Start, te = t.Bar.End;
+            if (Math.Abs(ts - _prevClipStart) < 0.01 || ts < start) ts = start;
+            if (Math.Abs(te - _prevClipEnd) < 0.01 || te > end) te = end;
+            if (te < ts) te = ts;
+            ApplyClipBounds(t.Bar);
+            t.Bar.SetRange(ts, te);
+        }
+        _prevClipStart = start;
+        _prevClipEnd = end;
+        UpdateTrimLabels();
+    }
+
+    /// <summary>A sound-track bar stays inside the clip and snaps to the clip's ends when dragged near them.</summary>
+    private void ApplyClipBounds(RangeBar bar)
+    {
+        bar.BoundStart = _videoBar.Start;
+        bar.BoundEnd = _videoBar.End;
+        bar.SnapPoints = new[] { _videoBar.Start, _videoBar.End };
+    }
+
+    private void SyncTracksToClip()
+    {
+        _prevClipStart = _videoBar.Start;
+        _prevClipEnd = _videoBar.End;
+        foreach (var t in _tracks) { ApplyClipBounds(t.Bar); t.Bar.SetRange(_videoBar.Start, _videoBar.End); }
+    }
+
     private void UpdateTrimLabels()
     {
         LengthLabel.Text = string.Format(CultureInfo.InvariantCulture, "{0}  to  {1}     new length {2}",
@@ -212,6 +250,7 @@ public sealed partial class EditorPage : Page
     {
         _videoBar.Reset(_duration);
         foreach (var t in _tracks) t.Bar.Reset(_duration);
+        SyncTracksToClip();
         UpdateTrimLabels();
     }
 

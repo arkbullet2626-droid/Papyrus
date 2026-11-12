@@ -32,6 +32,12 @@ public sealed class RangeBar : Grid
     /// <summary>The left bar moves in steps of this many seconds (0 = freely).</summary>
     public double StartStep { get; set; }
     public double MinLength { get; set; } = 0.5;
+    /// <summary>The bars cannot be dragged outside this part of the timeline (used to keep a sound track inside the clip).</summary>
+    public double BoundStart { get; set; }
+    public double BoundEnd { get; set; } = double.MaxValue;
+    /// <summary>Times a dragged bar jumps to when it comes within a few pixels of them. It can still be dragged away again.</summary>
+    public double[] SnapPoints { get; set; } = Array.Empty<double>();
+    private const double SnapPixels = 10;
 
     public event Action? RangeChanged;
     public event Action<double>? SeekRequested;
@@ -122,6 +128,11 @@ public sealed class RangeBar : Grid
         double w = _canvas.ActualWidth;
         if (w <= 0) return;
         double t = Math.Clamp(x / w, 0, 1) * Duration;
+        foreach (double p in SnapPoints)
+            if (Math.Abs(p / Duration * w - x) <= SnapPixels) { t = p; break; }
+        double lo = Math.Max(0, BoundStart), hi = Math.Min(Duration, BoundEnd);
+        if (hi < lo) hi = lo;
+        t = Math.Clamp(t, lo, hi);
         if (_drag == 1)
         {
             if (StartStep > 0) t = Math.Round(t / StartStep) * StartStep;
