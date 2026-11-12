@@ -22,14 +22,16 @@ static const wchar_t* const kPauseEvent = L"Local\\Papyrus.Worker.Pause";   // s
 static const wchar_t* const kWndClass  = L"PapyrusControl";
 static const wchar_t* const kMutex     = L"PapyrusControllerMutex";
 
-enum { IDC_TOGGLE = 101, IDC_ALWAYS, IDC_SAVE, IDC_OPEN, IDC_HOTKEY, IDC_LEN, IDC_FPS, IDC_QUAL, IDC_MODE, IDM_SHOW = 201, IDM_EXIT };
+enum { IDC_TOGGLE = 101, IDC_ALWAYS, IDC_SAVE, IDC_OPEN, IDC_HOTKEY, IDC_LEN, IDC_FPS, IDC_QUAL, IDC_MODE, IDC_MIC, IDM_SHOW = 201, IDM_EXIT };
 enum { WM_TRAY = WM_APP + 1, WM_SHOWME = WM_APP + 2, TIMER_WATCH = 1 };
 
-static HWND   g_wnd, g_toggle, g_always, g_save, g_open, g_status, g_hotkey, g_len, g_fps, g_qual, g_est, g_mode;
+static HWND   g_wnd, g_toggle, g_always, g_save, g_open, g_status, g_hotkey, g_len, g_fps, g_qual, g_est, g_mode, g_micBox;
 
 // Settings (settings.ini)
 static UINT s_vk = VK_F9, s_mods = MOD_CONTROL | MOD_SHIFT;
 static int  s_clip = 30, s_fps = 120, s_height = 2160;
+static bool s_mic = false;              // record the microphone as its own track
+static DWORD g_workerPid;               // the game process the running recorder is following (0 = none)
 static int  s_mode = 0;                 // 0 = fullscreen apps and games only, 1 = whole screen
 static bool g_armed, g_paused;          // armed = the user switched the buffer on; the recorder may still be waiting
 static ULONGLONG g_pausedSince;
@@ -114,6 +116,7 @@ static void loadSettings() {
     s_fps = (int)GetPrivateProfileIntW(L"papyrus", L"fps", 120, g_ini);
     s_height = (int)GetPrivateProfileIntW(L"papyrus", L"quality_height", 2160, g_ini);
     s_mode = GetPrivateProfileIntW(L"papyrus", L"capture_mode", 0, g_ini) == 1 ? 1 : 0;
+    s_mic = GetPrivateProfileIntW(L"papyrus", L"microphone", 0, g_ini) != 0;
     if (!s_vk) { s_vk = VK_F9; s_mods = MOD_CONTROL | MOD_SHIFT; }
     if (s_clip < 15 || s_clip > 120) s_clip = 30;
     if (s_fps != 120 && s_fps != 60 && s_fps != 30) s_fps = 120;
@@ -126,7 +129,7 @@ static void saveInt(const wchar_t* key, int v) {
 }
 static void saveSettings() {
     saveInt(L"hotkey_vk", (int)s_vk); saveInt(L"hotkey_mods", (int)s_mods);
-    saveInt(L"clip_seconds", s_clip); saveInt(L"fps", s_fps); saveInt(L"quality_height", s_height); saveInt(L"capture_mode", s_mode);
+    saveInt(L"clip_seconds", s_clip); saveInt(L"fps", s_fps); saveInt(L"quality_height", s_height); saveInt(L"capture_mode", s_mode); saveInt(L"microphone", s_mic ? 1 : 0);
 }
 
 static void registerHotkey(bool on) {
@@ -256,9 +259,14 @@ static bool startWorker() {
     g_paused = false;
     DeleteFileW(g_err);
     DeleteFileW(g_stat);
-    wchar_t cmd[MAX_PATH + 160];
-    swprintf(cmd, MAX_PATH + 160, L"\"%ls\" --replay --child --no-hotkey --parent %lu --clip %d --fps %d --height %d", g_exe,
-             GetCurrentProcessId(), s_clip, s_fps, s_height);
+    // In fullscreen-only mode the game's own sound goes on a separate track from everything else.
+    g_workerPid = 0;
+    if (s_mode == 0 && g_appWnd) GetWindowThreadProcessId(g_appWnd, &g_workerPid);
+    wchar_t cmd[MAX_PATH + 220], extra[80] = L"";
+    if (g_workerPid) swprintf(extra, 80, L" --game-pid %lu", g_workerPid);
+    if (s_mic) wcscat(extra, L" --mic");
+    swprintf(cmd, MAX_PATH + 220, L"\"%ls\" --replay --child --no-hotkey --parent %lu --clip %d --fps %d --height %d%ls", g_exe,
+             GetCurrentProcessId(), s_clip, s_fps, s_height, extra);
     STARTUPINFOW si{};
     si.cb = sizeof si;
     PROCESS_INFORMATION pi{};
@@ -291,7 +299,13 @@ static void evaluate() {
     const bool want = s_mode == 1 || fullscreenAppRunning();
     if (want) {
         if (!workerOn()) { if (!startWorker()) return; }
-        else if (g_paused) { ResetEvent(g_evPause); g_paused = false; }
+        else if (g_paused) {
+            // A different game than the one the recorder was following: restart so its sound is picked up.
+            DWORD pid = 0;
+            if (s_mode == 0 && g_appWnd) GetWindowThreadProcessId(g_appWnd, &pid);
+            if (s_mode == 0 && pid != g_workerPid) { stopWorker(); if (!startWorker()) return; }
+            else { ResetEvent(g_evPause); g_paused = false; }
+        }
     } else if (workerOn()) {
         if (!g_paused) { SetEvent(g_evPause); g_paused = true; g_pausedSince = GetTickCount64(); }
         else if (GetTickCount64() - g_pausedSince > PAUSE_STOP_AFTER_MS) stopWorker();
@@ -373,6 +387,11 @@ static LRESULT CALLBACK wndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             else if (LOWORD(wp) == IDC_FPS && s_fps != kFps[sel]) { s_fps = kFps[sel]; settingsChanged(); }
             else if (LOWORD(wp) == IDC_QUAL && s_height != kHeights[sel]) { s_height = kHeights[sel]; settingsChanged(); }
             else if (LOWORD(wp) == IDC_MODE && s_mode != sel) { s_mode = sel; saveSettings(); evaluate(); }
+            return 0;
+        }
+        if (LOWORD(wp) == IDC_MIC) {
+            s_mic = SendMessageW(g_micBox, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            settingsChanged();
             return 0;
         }
         if (LOWORD(wp) == IDC_HOTKEY) {
@@ -495,7 +514,7 @@ static int run(bool startHidden, const wchar_t* outDir, const wchar_t* dataDir, 
     RegisterClassExW(&wc);
 
     const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-    RECT rc{ 0, 0, S(440), S(560) };
+    RECT rc{ 0, 0, S(440), S(590) };
     AdjustWindowRectEx(&rc, style, FALSE, 0);
     const int ww = rc.right - rc.left, wh = rc.bottom - rc.top;
     g_wnd = CreateWindowExW(0, kWndClass, L"Papyrus", style, (GetSystemMetrics(SM_CXSCREEN) - ww) / 2, (GetSystemMetrics(SM_CYSCREEN) - wh) / 2,
@@ -530,15 +549,17 @@ static int run(bool startHidden, const wchar_t* outDir, const wchar_t* dataDir, 
     mk(L"STATIC", L"Quality", 0, 20, 316, 150, 22, 0, g_font);
     g_qual = mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 180, 312, 240, 220, IDC_QUAL, g_font);
     for (int i = 0; i < 5; i++) { SendMessageW(g_qual, CB_ADDSTRING, 0, (LPARAM)kHeightNames[i]); if (kHeights[i] == s_height) SendMessageW(g_qual, CB_SETCURSEL, i, 0); }
-    g_est = mk(L"STATIC", L"", 0, 20, 348, 400, 40, 0, g_font);
+    g_micBox = mk(L"BUTTON", L"Record my microphone too (as a separate sound track)", BS_AUTOCHECKBOX | WS_TABSTOP, 20, 346, 400, 24, IDC_MIC, g_font);
+    SendMessageW(g_micBox, BM_SETCHECK, s_mic ? BST_CHECKED : BST_UNCHECKED, 0);
+    g_est = mk(L"STATIC", L"", 0, 20, 378, 400, 40, 0, g_font);
     updateEstimate();
 
     g_always = mk(L"BUTTON", L"Always on: start Papyrus when Windows starts and turn the replay buffer on", BS_AUTOCHECKBOX | BS_MULTILINE | BS_TOP | WS_TABSTOP,
-                  20, 396, 400, 40, IDC_ALWAYS, g_font);
-    g_save = mk(L"BUTTON", L"Save clip now", BS_PUSHBUTTON | WS_TABSTOP, 20, 444, 194, 34, IDC_SAVE, g_font);
-    g_open = mk(L"BUTTON", L"Open clips folder", BS_PUSHBUTTON | WS_TABSTOP, 226, 444, 194, 34, IDC_OPEN, g_font);
-    mk(L"STATIC", L"Changing clip length, frame rate or quality while recording restarts the buffer. Closing this window keeps Papyrus in the tray near the clock; right-click its icon to exit.",
-       0, 20, 488, 400, 62, 0, g_font);
+                  20, 426, 400, 40, IDC_ALWAYS, g_font);
+    g_save = mk(L"BUTTON", L"Save clip now", BS_PUSHBUTTON | WS_TABSTOP, 20, 474, 194, 34, IDC_SAVE, g_font);
+    g_open = mk(L"BUTTON", L"Open clips folder", BS_PUSHBUTTON | WS_TABSTOP, 226, 474, 194, 34, IDC_OPEN, g_font);
+    mk(L"STATIC", L"Changing clip length, frame rate, quality or the microphone while recording restarts the buffer. Closing this window keeps Papyrus in the tray near the clock; right-click its icon to exit.",
+       0, 20, 518, 400, 62, 0, g_font);
 
     g_nid.cbSize = sizeof g_nid;
     g_nid.hWnd = g_wnd;

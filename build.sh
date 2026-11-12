@@ -9,5 +9,5 @@ mkdir -p dist
   -Wall -Wextra -Wno-missing-field-initializers -Wno-unused-parameter \
   -DPAPYRUS_VER="\"$VER\"" \
   engine/src/main.cpp -o dist/papyrus-engine.exe \
-  -ld3d11 -ldxgi -lavrt -lpdh -lpsapi -lwinmm -luser32 -lole32 -lshell32 -lgdi32 -ladvapi32 -lcomctl32 -ldwmapi -Wl,--subsystem,windows -s
+  -ld3d11 -ldxgi -lavrt -lpdh -lpsapi -lwinmm -luser32 -lole32 -lshell32 -lgdi32 -ladvapi32 -lcomctl32 -ldwmapi -lmfplat -lmmdevapi -Wl,--subsystem,windows -s
 ls -l dist/papyrus-engine.exe

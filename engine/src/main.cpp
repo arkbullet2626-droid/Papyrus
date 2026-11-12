@@ -34,6 +34,7 @@
 #include "mp4.h"
 #include "ring.h"
 #include "tier.h"
+#include "audio.h"
 #include "control.h"
 #include "../../third_party/nv-codec-headers/nvEncodeAPI.h"
 
@@ -135,6 +136,9 @@ struct Settings {
     bool     child       = false;   // hidden worker started by the control window
     bool     tray        = false;   // control window: start hidden in the tray
     DWORD    parentPid   = 0;
+    DWORD    gamePid     = 0;       // worker: process whose sound becomes the "Game" track
+    bool     mic         = false;   // also record the default microphone as its own track
+    bool     noAudio     = false;
     bool     noHotkey    = false;   // worker: the control window owns the hotkey
     int      height      = 0;       // wanted clip height (2160/1440/1080/720/480), 0 = same as the screen
     wchar_t  out[MAX_PATH] = L"";
@@ -668,7 +672,7 @@ static DWORD WINAPI outputThread(void*) {
             EnterCriticalSection(&g_replayLock);
             g_replay.beginPacket();
             hevcToLengthPrefixed(pkt, lb.bitstreamSizeInBytes, g_ps, [](const uint8_t* d, uint32_t n) { g_replay.write(d, n); });
-            g_replay.endPacket(isKey, (int64_t)lb.outputTimeStamp);
+            g_replay.endPacket(isKey, (int64_t)lb.outputTimeStamp, 0, (int64_t)((double)g_submitQpc[idx] * 1e7 / (double)g_qpf));
             LeaveCriticalSection(&g_replayLock);
         } else if (!g_cfg.discard) {
             if (g_cfg.raw) g_ring.push(pkt, lb.bitstreamSizeInBytes);
@@ -1115,6 +1119,15 @@ static bool parseHotkey(const wchar_t* text) {
     return true;
 }
 
+// Audio thread -> replay ring. Track numbers in the ring and the MP4 are 1.. for audio (0 is video).
+static void audioPacket(int track, const uint8_t* data, uint32_t size, int64_t t) {
+    EnterCriticalSection(&g_replayLock);
+    g_replay.beginPacket();
+    g_replay.write(data, size);
+    g_replay.endPacket(false, 0, track + 1, t);
+    LeaveCriticalSection(&g_replayLock);
+}
+
 // Writes the last g_cfg.clip seconds from the replay ring to a faststart MP4. No re-encode: packets are copied as they are.
 static void saveClip() {
     const int64_t t0 = qpc();
@@ -1125,10 +1138,24 @@ static void saveClip() {
     if (g_ps.complete() && g_replay.clipStart((int64_t)g_cfg.clip * g_cfg.fps, &startPkt)) {
         g_mp4.reset();
         const uint64_t endPkt = g_replay.pktHead;
-        for (uint64_t i = startPkt; i < endPkt; i++) g_mp4.addIndexed(g_replay.at(i).size, g_replay.at(i).key != 0);
         off = g_replay.at(startPkt).off;
         end = g_replay.at(endPkt - 1).off + g_replay.at(endPkt - 1).size;
-        have = g_mp4.nSamples > 0;
+        const int64_t videoStart = g_replay.at(startPkt).t;
+        int64_t audioStart[Mp4Mux::MAX_TRACKS] = { -1, -1, -1, -1 };
+        for (uint64_t i = startPkt; i < endPkt; i++) {
+            const ReplayRing::Pkt& p = g_replay.at(i);
+            if (p.track >= Mp4Mux::MAX_TRACKS) continue;
+            g_mp4.add(p.track, p.size, p.key != 0, p.off - off);
+            if (p.track && audioStart[p.track] < 0) audioStart[p.track] = p.t;
+        }
+        // Line each audio track up with the first video frame: delay it, or skip its first few samples.
+        for (int t = 1; t < Mp4Mux::MAX_TRACKS; t++) {
+            if (audioStart[t] < 0) continue;
+            const int64_t d = audioStart[t] - videoStart;
+            if (d >= 0) g_mp4.tr[t].emptyMs = (uint32_t)(d / 10000);
+            else g_mp4.tr[t].skipSamples = (uint32_t)((-d) * Mp4Mux::AUDIO_RATE / 10000000);
+        }
+        have = g_mp4.tr[0].n > 0;
     }
     LeaveCriticalSection(&g_replayLock);
     if (!have) { logf("  [save] nothing in the buffer yet - try again in a second\n"); Beep(300, 150); a_clipsFailed++; return; }
@@ -1150,7 +1177,8 @@ static void saveClip() {
     const DWORD ftypLen = Mp4Mux::writeFtyp(hdr);
     ok = ok && WriteFile(f, hdr, ftypLen, &wr, nullptr) && wr == ftypLen;
     ok = ok && WriteFile(f, g_mp4.moov, moovLen, &wr, nullptr) && wr == moovLen;
-    const DWORD mdatLen = Mp4Mux::writeMdatHeader(hdr, g_mp4.dataBytes);
+    const uint64_t dataBytes = end - off;
+    const DWORD mdatLen = Mp4Mux::writeMdatHeader(hdr, dataBytes);
     ok = ok && WriteFile(f, hdr, mdatLen, &wr, nullptr) && wr == mdatLen;
     bool evicted = false;
     while (ok && off < end) {
@@ -1170,9 +1198,9 @@ static void saveClip() {
         a_clipsFailed++;
         return;
     }
-    const double secs = (double)g_mp4.nSamples / g_cfg.fps;
+    const double secs = (double)g_mp4.tr[0].n / g_cfg.fps;
     logf("  [save] Clip saved (%02d:%02d, %ux%u @ %d fps, %.1f MB) in %.0f ms -> %ls\n", (int)secs / 60, (int)(secs + 0.5) % 60,
-         g_encW, g_encH, g_cfg.fps, (double)(dataStart + g_mp4.dataBytes) / 1048576.0, qpcMs(qpc() - t0), path);
+         g_encW, g_encH, g_cfg.fps, (double)(dataStart + dataBytes) / 1048576.0, qpcMs(qpc() - t0), path);
     a_clipsSaved++;
     Beep(1200, 80);
 }
@@ -1210,6 +1238,9 @@ static void usage() {
            "  --clip N       replay length in seconds: 15, 30, 60, 120 or 300 (default 30)\n"
            "  --hotkey K     save hotkey, e.g. ctrl+shift+f9 (default) or alt+f10\n"
            "  --autosave N   test helper: save one clip automatically after N seconds\n"
+           "  --game-pid N   put this process's sound on its own \"Game\" track (everything else goes to \"System\")\n"
+           "  --mic          also record the default microphone as a separate track\n"
+           "  --no-audio     video only\n"
            " Common options\n"
            "  --seconds N    how long to run (record: default 60; replay: default until Ctrl+C)\n"
            "  --fps N        frames per second (default 120)\n"
@@ -1266,6 +1297,9 @@ int wmain(int argc, wchar_t** argv) {
         else if (is(L"--child")) g_cfg.child = true;
         else if (is(L"--tray")) g_cfg.tray = true;
         else if (is(L"--no-hotkey")) g_cfg.noHotkey = true;
+        else if (is(L"--game-pid")) g_cfg.gamePid = (DWORD)num(1, 0x7fffffff);
+        else if (is(L"--mic")) g_cfg.mic = true;
+        else if (is(L"--no-audio")) g_cfg.noAudio = true;
         else if (is(L"--height")) g_cfg.height = num(240, 4320);
         else if (is(L"--parent")) g_cfg.parentPid = (DWORD)num(1, 0x7fffffff);
         else if (is(L"--clip")) { g_cfg.clip = num(5, 300); }
@@ -1381,9 +1415,11 @@ int wmain(int argc, wchar_t** argv) {
         g_slabBytes = papyrusSlabBytes(g_cfg.bitrateMbps, g_cfg.clip);
         uint8_t* slab = (uint8_t*)VirtualAlloc(nullptr, (SIZE_T)g_slabBytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         if (!slab) fatal("Could not allocate the %llu MB replay buffer. Choose a shorter --clip.", (unsigned long long)(g_slabBytes >> 20));
-        const uint64_t maxPkts = (uint64_t)(g_cfg.clip + 6) * (uint64_t)g_cfg.fps;
+        const uint64_t maxVideo = (uint64_t)(g_cfg.clip + 6) * (uint64_t)g_cfg.fps;
+        const uint64_t maxAudio = (uint64_t)(g_cfg.clip + 6) * 50;      // 46.9 AAC frames per second per track
+        const uint64_t maxPkts = maxVideo + maxAudio * 3;
         if (!g_replay.init(slab, g_slabBytes, maxPkts, (int64_t)(g_cfg.clip + 2) * g_cfg.fps)) fatal("Could not allocate the replay index");
-        if (!g_mp4.init(maxPkts, g_encW, g_encH, (uint32_t)g_cfg.fps)) fatal("Could not allocate the MP4 index tables");
+        if (!g_mp4.init(maxVideo, maxAudio, g_encW, g_encH, (uint32_t)g_cfg.fps)) fatal("Could not allocate the MP4 index tables");
         g_scratch = (uint8_t*)VirtualAlloc(nullptr, SCRATCH_BYTES, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         InitializeCriticalSectionAndSpinCount(&g_replayLock, 2000);
         g_evSave = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -1394,12 +1430,33 @@ int wmain(int argc, wchar_t** argv) {
         SetFileInformationByHandle(g_file, FileIoPriorityHintInfo, &hint, sizeof hint);
         g_ring.init(16ull << 20);
         if (!g_cfg.raw) {
-            if (!g_mp4.init((uint64_t)g_cfg.seconds * (uint64_t)g_cfg.fps, g_encW, g_encH, (uint32_t)g_cfg.fps))
+            if (!g_mp4.init((uint64_t)g_cfg.seconds * (uint64_t)g_cfg.fps, 0, g_encW, g_encH, (uint32_t)g_cfg.fps))
                 fatal("Could not allocate the MP4 index tables");
             uint8_t hdr[64];
             DWORD hdrLen = Mp4Mux::writeFtyp(hdr), wr = 0;
             hdrLen += Mp4Mux::writeMdatHeader(hdr + hdrLen, 0);
             if (!WriteFile(g_file, hdr, hdrLen, &wr, nullptr) || wr != hdrLen) fatal("Could not write the MP4 header");
+        }
+    }
+    // Sound: starts now so it is already running when the first video keyframe lands in the buffer.
+    char audioDesc[96] = "no sound";
+    if (g_cfg.replay && !g_cfg.noAudio) {
+        aud::Config ac;
+        ac.gamePid = g_cfg.gamePid;
+        ac.mic = g_cfg.mic;
+        ac.onPacket = audioPacket;
+        ac.log = logf;
+        ac.pauseEvent = g_cfg.child ? OpenEventW(SYNCHRONIZE, FALSE, ctl::kPauseEvent) : nullptr;
+        ac.qpcFreq = g_qpf;
+        const int nAudio = aud::start(ac);
+        if (nAudio > 0) {
+            audioDesc[0] = 0;
+            for (int i = 0; i < nAudio; i++) {
+                g_mp4.setName(i + 1, aud::g_tracks[i].label);
+                if (i) strcat(audioDesc, " + ");
+                strcat(audioDesc, aud::g_tracks[i].label);
+            }
+            strcat(audioDesc, nAudio > 1 ? " sound (separate tracks)" : " sound");
         }
     }
     const double slabMb = (double)g_slabBytes / 1048576.0;
@@ -1416,6 +1473,7 @@ int wmain(int argc, wchar_t** argv) {
     logf("  Encode        : HEVC 8-bit %ux%u @ %d fps, preset P%d, VBR %d/%d Mbps, 1 s GOP, no B-frames\n",
          g_encW, g_encH, g_cfg.fps, g_cfg.preset, g_cfg.bitrateMbps, g_cfg.maxrateMbps);
     logf("  Timer         : %s\n", hiRes ? "high-resolution" : "1 ms fallback");
+    if (g_cfg.replay) logf("  Audio         : %s, AAC 48 kHz stereo 160 kbps per track\n", audioDesc);
     logf("  Startup       : %.0f ms to ready\n", startupMs);
     if (g_cfg.replay) {
         logf("  Replay buffer : last %d s kept in RAM, %.0f MB slab (fills up over the first %d s)\n", g_cfg.clip, slabMb, g_cfg.clip + 2);
@@ -1432,8 +1490,8 @@ int wmain(int argc, wchar_t** argv) {
         hotkeyOk = g_cfg.noHotkey || RegisterHotKey(nullptr, 1, g_cfg.hkMods | MOD_NOREPEAT, g_cfg.hkVk) != 0;
         if (g_cfg.child) {
             char st[200];
-            if (g_encW != g_srcW || g_encH != g_srcH) snprintf(st, sizeof st, "Recording %ux%u (scaled down from %ux%u) at %d fps.", g_encW, g_encH, g_srcW, g_srcH, g_cfg.fps);
-            else snprintf(st, sizeof st, "Recording %ux%u at %d fps.", g_encW, g_encH, g_cfg.fps);
+            if (g_encW != g_srcW || g_encH != g_srcH) snprintf(st, sizeof st, "Recording %ux%u (scaled down from %ux%u) at %d fps, %s.", g_encW, g_encH, g_srcW, g_srcH, g_cfg.fps, audioDesc);
+            else snprintf(st, sizeof st, "Recording %ux%u at %d fps, %s.", g_encW, g_encH, g_cfg.fps, audioDesc);
             writeSmallFile(g_statPath, st);
         }
         if (!hotkeyOk)
@@ -1584,6 +1642,7 @@ int wmain(int argc, wchar_t** argv) {
         }
         CloseHandle(g_file);
     }
+    aud::stop();
     if (hSave) {
         g_saveQuit.store(true);
         SetEvent(g_evSave);

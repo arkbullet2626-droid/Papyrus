@@ -1,5 +1,5 @@
 // Papyrus - replay ring: one pre-allocated slab of compressed packets plus a small packet index.
-// Only encoded video ever goes in here. Oldest GOPs (keyframe + the frames that depend on it) are evicted whole.
+// Only encoded video and audio packets ever go in here. Oldest GOPs (keyframe + the frames that depend on it) are evicted whole.
 // Not thread-safe by itself: the caller holds one lock around every call. Nothing allocates after init().
 // Platform-neutral (plain C++) so it is tested off-Windows.
 #pragma once
@@ -8,7 +8,10 @@
 #include <cstring>
 
 struct ReplayRing {
-    struct Pkt { uint64_t off; uint32_t size; uint32_t key; int64_t pts; };
+    // track 0 = video (pts = frame number), 1.. = audio. key is set only on video keyframes, so the buffer always
+    // starts and is trimmed at a video keyframe; audio packets in between simply ride along.
+    // t = when the packet's content was captured (100 ns units on the QPC clock) - used to line audio up with video.
+    struct Pkt { uint64_t off; uint32_t size; uint16_t key; uint16_t track; int64_t pts; int64_t t; };
 
     uint8_t* slab = nullptr;   uint64_t cap = 0;
     Pkt*     pkts = nullptr;   uint64_t maxPkts = 0;
@@ -49,15 +52,16 @@ struct ReplayRing {
         if (first < n) memcpy(slab, p + first, (size_t)(n - first));
         byteHead += n;
     }
-    void endPacket(bool key, int64_t pts) {
+    void endPacket(bool key, int64_t pts, int track = 0, int64_t t = 0) {
         const uint32_t size = (uint32_t)(byteHead - pendingStart);
         if (!size) return;
         if (byteTail > pendingStart) { byteTail = byteHead; pktTail = pktHead; return; }   // could not fit: start over
         if (pktTail == pktHead && !key) { byteHead = pendingStart; return; }               // never start the buffer mid-GOP
         if (pktHead - pktTail == maxPkts) evictGop();
         Pkt& k = pkts[pktHead % maxPkts];
-        k.off = pendingStart; k.size = size; k.key = key ? 1u : 0u; k.pts = pts;
+        k.off = pendingStart; k.size = size; k.key = key ? 1 : 0; k.track = (uint16_t)track; k.pts = pts; k.t = t;
         pktHead++;
+        if (track != 0) return;                      // only video advances the time window
         // time-based trim: drop the oldest GOP while the GOP after it is already old enough to cover the window
         for (;;) {
             uint64_t next = pktTail + 1;
@@ -71,7 +75,10 @@ struct ReplayRing {
     // Returns false if the buffer is empty.
     bool clipStart(int64_t frames, uint64_t* startPkt) const {
         if (pktTail == pktHead) return false;
-        const int64_t want = at(pktHead - 1).pts - frames + 1;
+        int64_t newest = -1;
+        for (uint64_t i = pktHead; i-- > pktTail;) if (at(i).track == 0) { newest = at(i).pts; break; }
+        if (newest < 0) return false;
+        const int64_t want = newest - frames + 1;
         uint64_t best = pktTail;
         for (uint64_t i = pktHead; i-- > pktTail;) {
             if (at(i).key && at(i).pts <= want) { best = i; break; }

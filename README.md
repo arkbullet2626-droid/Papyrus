@@ -4,7 +4,7 @@ An ultra-light instant-replay game clipper for Windows by Opifex Studios.
 
 Papyrus keeps the last 30 seconds of your screen in memory as compressed video. Press **Ctrl+Shift+F9** and those 30 seconds are saved as an `.mp4`.
 
-**Status: early development.** NVIDIA cards only, video only.
+**Status: early development.** NVIDIA cards only.
 
 ## Download
 
@@ -35,6 +35,7 @@ The video is HEVC (H.265). VLC plays it directly; Windows' own players need the 
 
 - Capture: Windows Graphics Capture. No hooks, no DLL injection.
 - Colour conversion on the GPU, encoding on the card's NVENC block. A raw frame never leaves the GPU.
+- Sound is captured with WASAPI (the game on its own track, everything else on another, optional microphone) and encoded to AAC.
 - Only compressed packets are buffered, in one pre-allocated block of RAM.
 - Saving a clip copies packets into an MP4 without re-encoding.
 - No network connections, no telemetry, no accounts.

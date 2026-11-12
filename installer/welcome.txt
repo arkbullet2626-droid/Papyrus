@@ -13,4 +13,4 @@ After setup:
 If an older Papyrus is still running in a black window, close that window before you continue.
 
 This early version needs an NVIDIA graphics card with a current driver (570 or newer).
-It has no sound yet. Papyrus makes no network connections and collects nothing.
+Papyrus makes no network connections and collects nothing.

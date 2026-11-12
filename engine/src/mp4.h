@@ -1,4 +1,4 @@
-// Papyrus - small self-contained MP4 writer for one HEVC video track (no third-party code).
+// Papyrus - small self-contained MP4 writer: one HEVC video track plus up to 3 AAC audio tracks (no third-party code).
 //
 // Two ways to use it, both without any allocation after init():
 //   streaming (manual recording):  ftyp | mdat (frames as they arrive) | moov (index, written at the end)
@@ -62,43 +62,61 @@ static inline uint32_t hevcToLengthPrefixed(const uint8_t* p, uint32_t n, HevcPa
 }
 
 struct Mp4Mux {
-    enum { FTYP_LEN = 28, MDAT_HDR_LEN = 16 };
+    enum { FTYP_LEN = 28, MDAT_HDR_LEN = 16, MAX_TRACKS = 4, AUDIO_RATE = 48000, AUDIO_FRAME = 1024 };
+
+    // Track 0 is video. Tracks 1.. are audio. Every sample is its own chunk, so samples of different tracks can
+    // sit in the file in any order (they are stored in the order they were recorded).
+    struct Track {
+        uint32_t* sizes = nullptr;
+        uint64_t* offs = nullptr;      // relative to the first byte of sample data
+        uint32_t* sync = nullptr;      // video only: 1-based keyframe sample numbers
+        uint64_t  maxSamples = 0, n = 0;
+        uint32_t  maxSync = 0, nSync = 0;
+        char      name[32] = "";       // shown by players as the track name
+        uint32_t  emptyMs = 0;         // audio: silence before the first sample (lines the track up with the video)
+        uint32_t  skipSamples = 0;     // audio: samples to skip at the start
+    };
 
     uint32_t width = 0, height = 0, fps = 0;
+    Track    tr[MAX_TRACKS];
+    uint64_t dataBytes = 0;            // running total, for callers that write samples back to back
+    uint64_t overflow = 0;
+    uint8_t* moov = nullptr;           size_t moovCap = 0;
 
-    // index tables (allocated once)
-    uint32_t* sizes = nullptr;     uint64_t maxSamples = 0, nSamples = 0;
-    uint64_t* chunkOff = nullptr;  uint32_t maxChunks = 0,  nChunks = 0;     // relative to the first byte of sample data
-    uint32_t* sync = nullptr;      uint32_t maxSync = 0,    nSync = 0;
-    uint32_t  samplesPerChunk = 0;
-    uint64_t  dataBytes = 0;       // total sample bytes indexed so far
-    uint64_t  overflow = 0;        // samples that did not fit the tables (should stay 0)
-    uint8_t*  moov = nullptr;      size_t moovCap = 0;
-
-    bool init(uint64_t samplesMax, uint32_t w, uint32_t h, uint32_t framesPerSecond) {
+    bool init(uint64_t videoSamplesMax, uint64_t audioSamplesMax, uint32_t w, uint32_t h, uint32_t framesPerSecond) {
         width = w; height = h; fps = framesPerSecond;
-        samplesPerChunk = fps;
-        maxSamples = samplesMax + fps;
-        maxChunks = (uint32_t)(maxSamples / samplesPerChunk) + 2;
-        maxSync = maxChunks * 4;
-        sizes = (uint32_t*)calloc((size_t)maxSamples, sizeof(uint32_t));
-        chunkOff = (uint64_t*)calloc(maxChunks, sizeof(uint64_t));
-        sync = (uint32_t*)calloc(maxSync, sizeof(uint32_t));
-        moovCap = (size_t)maxSamples * 4 + (size_t)maxChunks * 8 + (size_t)maxSync * 4 + 8192;
+        moovCap = 16384;
+        bool ok = true;
+        for (int t = 0; t < MAX_TRACKS; t++) {
+            Track& k = tr[t];
+            k.maxSamples = t == 0 ? videoSamplesMax + fps : audioSamplesMax;
+            if (!k.maxSamples) continue;
+            k.sizes = (uint32_t*)calloc((size_t)k.maxSamples, sizeof(uint32_t));
+            k.offs = (uint64_t*)calloc((size_t)k.maxSamples, sizeof(uint64_t));
+            if (t == 0) { k.maxSync = (uint32_t)(k.maxSamples / fps + 2) * 4; k.sync = (uint32_t*)calloc(k.maxSync, sizeof(uint32_t)); }
+            ok = ok && k.sizes && k.offs && (t != 0 || k.sync);
+            moovCap += (size_t)k.maxSamples * 12 + (size_t)k.maxSync * 4 + 2048;
+        }
         moov = (uint8_t*)malloc(moovCap);
-        return sizes && chunkOff && sync && moov;
+        return ok && moov;
     }
-    void reset() { nSamples = 0; nChunks = 0; nSync = 0; dataBytes = 0; overflow = 0; }
+    void reset() {
+        for (int t = 0; t < MAX_TRACKS; t++) { tr[t].n = 0; tr[t].nSync = 0; tr[t].emptyMs = 0; tr[t].skipSamples = 0; }
+        dataBytes = 0; overflow = 0;
+    }
+    void setName(int track, const char* name) { strncpy(tr[track].name, name, sizeof tr[track].name - 1); }
 
-    // Record one sample of `size` bytes (already length-prefixed) in the index.
-    void addIndexed(uint32_t size, bool keyframe) {
-        if (!size) return;
-        if (nSamples >= maxSamples) { overflow++; dataBytes += size; return; }
-        if (nSamples % samplesPerChunk == 0 && nChunks < maxChunks) chunkOff[nChunks++] = dataBytes;
-        sizes[nSamples++] = size;
-        if (keyframe && nSync < maxSync) sync[nSync++] = (uint32_t)nSamples;   // 1-based
-        dataBytes += size;
+    // Record one sample: `size` bytes at `relOffset` from the start of the sample data.
+    void add(int track, uint32_t size, bool keyframe, uint64_t relOffset) {
+        if (!size || track < 0 || track >= MAX_TRACKS) return;
+        Track& k = tr[track];
+        if (k.n >= k.maxSamples) { overflow++; return; }
+        k.offs[k.n] = relOffset;
+        k.sizes[k.n++] = size;
+        if (track == 0 && keyframe && k.nSync < k.maxSync) k.sync[k.nSync++] = (uint32_t)k.n;
     }
+    // Same, for samples written one after another (streaming mode).
+    void addIndexed(uint32_t size, bool keyframe) { add(0, size, keyframe, dataBytes); dataBytes += size; }
 
     static uint32_t writeFtyp(uint8_t* out) {
         static const uint8_t ftyp[FTYP_LEN] = {
@@ -116,102 +134,139 @@ struct Mp4Mux {
         return MDAT_HDR_LEN;
     }
 
+    uint32_t trackDurationMs(int t) const {
+        const Track& k = tr[t];
+        if (t == 0) return (uint32_t)(k.n * 1000 / fps);
+        const uint64_t samples = k.n * AUDIO_FRAME;
+        return (uint32_t)((samples > k.skipSamples ? samples - k.skipSamples : 0) * 1000 / AUDIO_RATE) + k.emptyMs;
+    }
+
     // Builds the index into the internal buffer. dataStart = absolute file offset of the first sample byte.
     // Returns its length, or 0 if there is nothing to write.
     uint32_t buildMoov(const HevcParamSets& ps, uint64_t dataStart) {
-        if (!nSamples || !ps.complete()) return 0;
+        if (!tr[0].n || !ps.complete()) return 0;
         W w{ moov, 0 };
-        const uint32_t durMovie = (uint32_t)(nSamples * 1000 / fps);
-        const uint32_t durMedia = (uint32_t)nSamples;          // media timescale = fps, every frame lasts 1
+        uint32_t durMovie = 0;
+        for (int t = 0; t < MAX_TRACKS; t++) if (tr[t].n && trackDurationMs(t) > durMovie) durMovie = trackDurationMs(t);
 
         size_t bMoov = w.begin("moov");
         {
             size_t b = w.begin("mvhd");
             w.u32(0); w.u32(0); w.u32(0); w.u32(1000); w.u32(durMovie);
             w.u32(0x00010000); w.u16(0x0100); w.zero(10);
-            matrix(w); w.zero(24); w.u32(2);
+            matrix(w); w.zero(24); w.u32((uint32_t)MAX_TRACKS + 1);
             w.end(b);
         }
-        size_t trak = w.begin("trak");
-        {
-            size_t b = w.begin("tkhd");
-            w.u32(0x00000003); w.u32(0); w.u32(0); w.u32(1); w.u32(0); w.u32(durMovie);
-            w.zero(8); w.u16(0); w.u16(0); w.u16(0); w.u16(0);
-            matrix(w); w.u32(width << 16); w.u32(height << 16);
-            w.end(b);
-        }
-        size_t mdia = w.begin("mdia");
-        {
-            size_t b = w.begin("mdhd");
-            w.u32(0); w.u32(0); w.u32(0); w.u32(fps); w.u32(durMedia); w.u16(0x55C4); w.u16(0);
-            w.end(b);
-            b = w.begin("hdlr");
-            w.u32(0); w.u32(0); w.bytes("vide", 4); w.zero(12); w.bytes("Papyrus Video", 14);
-            w.end(b);
-        }
-        size_t minf = w.begin("minf");
-        {
-            size_t b = w.begin("vmhd");
-            w.u32(1); w.zero(8);
-            w.end(b);
-            size_t dinf = w.begin("dinf");
-            size_t dref = w.begin("dref");
-            w.u32(0); w.u32(1);
-            size_t url = w.begin("url ");
-            w.u32(1);
-            w.end(url); w.end(dref); w.end(dinf);
-        }
-        size_t stbl = w.begin("stbl");
-        {
-            size_t stsd = w.begin("stsd");
-            w.u32(0); w.u32(1);
-            size_t hvc1 = w.begin("hvc1");
-            w.zero(6); w.u16(1);
-            w.zero(16);
-            w.u16((uint16_t)width); w.u16((uint16_t)height);
-            w.u32(0x00480000); w.u32(0x00480000); w.u32(0);
-            w.u16(1);
-            w.zero(32);
-            w.u16(0x0018); w.u16(0xFFFF);
-            writeHvcC(w, ps);
-            size_t colr = w.begin("colr");                   // BT.709, limited range - matches what the engine encodes
-            w.bytes("nclx", 4); w.u16(1); w.u16(1); w.u16(1); w.u8(0);
-            w.end(colr);
-            w.end(hvc1);
-            w.end(stsd);
+        for (int t = 0; t < MAX_TRACKS; t++) {
+            const Track& k = tr[t];
+            if (!k.n) continue;
+            const bool audio = t != 0;
+            const uint32_t timescale = audio ? (uint32_t)AUDIO_RATE : fps;
+            const uint32_t delta = audio ? (uint32_t)AUDIO_FRAME : 1;
+            const uint32_t durTrack = trackDurationMs(t);
 
-            size_t b = w.begin("stts");
-            w.u32(0); w.u32(1); w.u32((uint32_t)nSamples); w.u32(1);
-            w.end(b);
-
-            b = w.begin("stss");
-            w.u32(0); w.u32(nSync);
-            for (uint32_t i = 0; i < nSync; i++) w.u32(sync[i]);
-            w.end(b);
-
-            b = w.begin("stsc");
-            const uint32_t rem = (uint32_t)(nSamples % samplesPerChunk);
-            const bool partialLast = rem != 0 && nChunks > 1;
-            w.u32(0);
-            if (nChunks == 1) { w.u32(1); w.u32(1); w.u32((uint32_t)nSamples); w.u32(1); }
-            else {
-                w.u32(partialLast ? 2 : 1);
-                w.u32(1); w.u32(samplesPerChunk); w.u32(1);
-                if (partialLast) { w.u32(nChunks); w.u32(rem); w.u32(1); }
+            size_t trak = w.begin("trak");
+            {
+                size_t b = w.begin("tkhd");
+                w.u32(0x00000003); w.u32(0); w.u32(0); w.u32((uint32_t)t + 1); w.u32(0); w.u32(durTrack);
+                w.zero(8); w.u16(0);
+                w.u16(audio ? 1 : 0);                        // audio tracks are alternates of each other: players pick one
+                w.u16(audio ? 0x0100 : 0); w.u16(0);
+                matrix(w);
+                w.u32(audio ? 0 : width << 16); w.u32(audio ? 0 : height << 16);
+                w.end(b);
             }
-            w.end(b);
+            if (audio && (k.emptyMs || k.skipSamples)) {
+                size_t edts = w.begin("edts");
+                size_t elst = w.begin("elst");
+                w.u32(0); w.u32(k.emptyMs ? 2 : 1);
+                if (k.emptyMs) { w.u32(k.emptyMs); w.u32(0xFFFFFFFF); w.u32(0x00010000); }
+                w.u32(durTrack - k.emptyMs); w.u32(k.skipSamples); w.u32(0x00010000);
+                w.end(elst); w.end(edts);
+            }
+            size_t mdia = w.begin("mdia");
+            {
+                size_t b = w.begin("mdhd");
+                w.u32(0); w.u32(0); w.u32(0); w.u32(timescale); w.u32((uint32_t)(k.n * delta)); w.u16(0x55C4); w.u16(0);
+                w.end(b);
+                b = w.begin("hdlr");
+                w.u32(0); w.u32(0); w.bytes(audio ? "soun" : "vide", 4); w.zero(12);
+                const char* nm = k.name[0] ? k.name : (audio ? "Audio" : "Papyrus Video");
+                w.bytes(nm, strlen(nm) + 1);
+                w.end(b);
+            }
+            size_t minf = w.begin("minf");
+            {
+                size_t b;
+                if (audio) { b = w.begin("smhd"); w.u32(0); w.u32(0); w.end(b); }
+                else       { b = w.begin("vmhd"); w.u32(1); w.zero(8); w.end(b); }
+                size_t dinf = w.begin("dinf");
+                size_t dref = w.begin("dref");
+                w.u32(0); w.u32(1);
+                size_t url = w.begin("url ");
+                w.u32(1);
+                w.end(url); w.end(dref); w.end(dinf);
+            }
+            size_t stbl = w.begin("stbl");
+            {
+                size_t stsd = w.begin("stsd");
+                w.u32(0); w.u32(1);
+                if (audio) {
+                    size_t mp4a = w.begin("mp4a");
+                    w.zero(6); w.u16(1);
+                    w.zero(8);
+                    w.u16(2); w.u16(16); w.u32(0);           // stereo, 16-bit
+                    w.u32((uint32_t)AUDIO_RATE << 16);
+                    size_t esds = w.begin("esds");
+                    w.u32(0);
+                    w.u8(0x03); w.u8(25); w.u16((uint16_t)(t + 1)); w.u8(0);             // ES descriptor
+                    w.u8(0x04); w.u8(17); w.u8(0x40); w.u8(0x15); w.u8(0); w.u16(0x1800); // AAC, audio stream, buffer size
+                    w.u32(192000); w.u32(160000);                                         // max / average bitrate
+                    w.u8(0x05); w.u8(2); w.u8(0x11); w.u8(0x90);                          // AAC-LC, 48 kHz, stereo
+                    w.u8(0x06); w.u8(1); w.u8(0x02);
+                    w.end(esds);
+                    w.end(mp4a);
+                } else {
+                    size_t hvc1 = w.begin("hvc1");
+                    w.zero(6); w.u16(1);
+                    w.zero(16);
+                    w.u16((uint16_t)width); w.u16((uint16_t)height);
+                    w.u32(0x00480000); w.u32(0x00480000); w.u32(0);
+                    w.u16(1);
+                    w.zero(32);
+                    w.u16(0x0018); w.u16(0xFFFF);
+                    writeHvcC(w, ps);
+                    size_t colr = w.begin("colr");           // BT.709, limited range - matches what the engine encodes
+                    w.bytes("nclx", 4); w.u16(1); w.u16(1); w.u16(1); w.u8(0);
+                    w.end(colr);
+                    w.end(hvc1);
+                }
+                w.end(stsd);
 
-            b = w.begin("stsz");
-            w.u32(0); w.u32(0); w.u32((uint32_t)nSamples);
-            for (uint64_t i = 0; i < nSamples; i++) w.u32(sizes[i]);
-            w.end(b);
-
-            b = w.begin("co64");
-            w.u32(0); w.u32(nChunks);
-            for (uint32_t i = 0; i < nChunks; i++) w.u64(dataStart + chunkOff[i]);
-            w.end(b);
+                size_t b = w.begin("stts");
+                w.u32(0); w.u32(1); w.u32((uint32_t)k.n); w.u32(delta);
+                w.end(b);
+                if (!audio) {
+                    b = w.begin("stss");
+                    w.u32(0); w.u32(k.nSync);
+                    for (uint32_t i = 0; i < k.nSync; i++) w.u32(k.sync[i]);
+                    w.end(b);
+                }
+                b = w.begin("stsc");                         // one sample per chunk
+                w.u32(0); w.u32(1); w.u32(1); w.u32(1); w.u32(1);
+                w.end(b);
+                b = w.begin("stsz");
+                w.u32(0); w.u32(0); w.u32((uint32_t)k.n);
+                for (uint64_t i = 0; i < k.n; i++) w.u32(k.sizes[i]);
+                w.end(b);
+                b = w.begin("co64");
+                w.u32(0); w.u32((uint32_t)k.n);
+                for (uint64_t i = 0; i < k.n; i++) w.u64(dataStart + k.offs[i]);
+                w.end(b);
+            }
+            w.end(stbl); w.end(minf); w.end(mdia); w.end(trak);
         }
-        w.end(stbl); w.end(minf); w.end(mdia); w.end(trak); w.end(bMoov);
+        w.end(bMoov);
         return (uint32_t)w.n;
     }
 
