@@ -1,0 +1,15 @@
+Papyrus - instant replay for your games
+
+Papyrus keeps the last 30 seconds of your main monitor in memory as compressed video.
+Press Ctrl+Shift+F9 at any time and those 30 seconds are saved as an .mp4.
+
+After setup:
+  - Start "Papyrus" from the Start menu. A small black window opens - leave it running.
+  - Press Ctrl+Shift+F9 in a game. High beep = clip saved.
+  - Clips are saved in your Videos\Papyrus folder ("Papyrus clips folder" in the Start menu).
+  - Press Ctrl+C in the black window (or close it) to stop.
+
+This early version needs an NVIDIA graphics card with a current driver (570 or newer).
+It has no sound, tray icon or settings window yet - those arrive in later versions.
+
+Papyrus makes no network connections and collects nothing.
