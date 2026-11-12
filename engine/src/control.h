@@ -514,7 +514,7 @@ static int run(bool startHidden, const wchar_t* outDir, const wchar_t* dataDir, 
     RegisterClassExW(&wc);
 
     const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-    RECT rc{ 0, 0, S(440), S(590) };
+    RECT rc{ 0, 0, S(440), S(632) };
     AdjustWindowRectEx(&rc, style, FALSE, 0);
     const int ww = rc.right - rc.left, wh = rc.bottom - rc.top;
     g_wnd = CreateWindowExW(0, kWndClass, L"Papyrus", style, (GetSystemMetrics(SM_CXSCREEN) - ww) / 2, (GetSystemMetrics(SM_CYSCREEN) - wh) / 2,
@@ -551,15 +551,15 @@ static int run(bool startHidden, const wchar_t* outDir, const wchar_t* dataDir, 
     for (int i = 0; i < 5; i++) { SendMessageW(g_qual, CB_ADDSTRING, 0, (LPARAM)kHeightNames[i]); if (kHeights[i] == s_height) SendMessageW(g_qual, CB_SETCURSEL, i, 0); }
     g_micBox = mk(L"BUTTON", L"Record my microphone too (as a separate sound track)", BS_AUTOCHECKBOX | WS_TABSTOP, 20, 346, 400, 24, IDC_MIC, g_font);
     SendMessageW(g_micBox, BM_SETCHECK, s_mic ? BST_CHECKED : BST_UNCHECKED, 0);
-    g_est = mk(L"STATIC", L"", 0, 20, 378, 400, 40, 0, g_font);
+    g_est = mk(L"STATIC", L"", 0, 20, 378, 400, 60, 0, g_font);
     updateEstimate();
 
     g_always = mk(L"BUTTON", L"Always on: start Papyrus when Windows starts and turn the replay buffer on", BS_AUTOCHECKBOX | BS_MULTILINE | BS_TOP | WS_TABSTOP,
-                  20, 426, 400, 40, IDC_ALWAYS, g_font);
-    g_save = mk(L"BUTTON", L"Save clip now", BS_PUSHBUTTON | WS_TABSTOP, 20, 474, 194, 34, IDC_SAVE, g_font);
-    g_open = mk(L"BUTTON", L"Open clips folder", BS_PUSHBUTTON | WS_TABSTOP, 226, 474, 194, 34, IDC_OPEN, g_font);
-    mk(L"STATIC", L"Changing clip length, frame rate, quality or the microphone while recording restarts the buffer. Closing this window keeps Papyrus in the tray near the clock; right-click its icon to exit.",
-       0, 20, 518, 400, 62, 0, g_font);
+                  20, 446, 400, 40, IDC_ALWAYS, g_font);
+    g_save = mk(L"BUTTON", L"Save clip now", BS_PUSHBUTTON | WS_TABSTOP, 20, 494, 194, 34, IDC_SAVE, g_font);
+    g_open = mk(L"BUTTON", L"Open clips folder", BS_PUSHBUTTON | WS_TABSTOP, 226, 494, 194, 34, IDC_OPEN, g_font);
+    mk(L"STATIC", L"Sound: the game, Spotify and Discord each get their own track; no other app is recorded. Changing clip length, frame rate, quality or the microphone while recording restarts the buffer. Closing this window keeps Papyrus in the tray near the clock; right-click its icon to exit.",
+       0, 20, 538, 400, 86, 0, g_font);
 
     g_nid.cbSize = sizeof g_nid;
     g_nid.hWnd = g_wnd;

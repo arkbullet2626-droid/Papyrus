@@ -1141,7 +1141,8 @@ static void saveClip() {
         off = g_replay.at(startPkt).off;
         end = g_replay.at(endPkt - 1).off + g_replay.at(endPkt - 1).size;
         const int64_t videoStart = g_replay.at(startPkt).t;
-        int64_t audioStart[Mp4Mux::MAX_TRACKS] = { -1, -1, -1, -1 };
+        int64_t audioStart[Mp4Mux::MAX_TRACKS];
+        for (int t = 0; t < Mp4Mux::MAX_TRACKS; t++) audioStart[t] = -1;
         for (uint64_t i = startPkt; i < endPkt; i++) {
             const ReplayRing::Pkt& p = g_replay.at(i);
             if (p.track >= Mp4Mux::MAX_TRACKS) continue;
@@ -1238,7 +1239,7 @@ static void usage() {
            "  --clip N       replay length in seconds: 15, 30, 60, 120 or 300 (default 30)\n"
            "  --hotkey K     save hotkey, e.g. ctrl+shift+f9 (default) or alt+f10\n"
            "  --autosave N   test helper: save one clip automatically after N seconds\n"
-           "  --game-pid N   put this process's sound on its own \"Game\" track (everything else goes to \"System\")\n"
+           "  --game-pid N   record this process's sound as the \"Game\" track (Spotify and Discord get their own; nothing else is recorded)\n"
            "  --mic          also record the default microphone as a separate track\n"
            "  --no-audio     video only\n"
            " Common options\n"
@@ -1417,7 +1418,7 @@ int wmain(int argc, wchar_t** argv) {
         if (!slab) fatal("Could not allocate the %llu MB replay buffer. Choose a shorter --clip.", (unsigned long long)(g_slabBytes >> 20));
         const uint64_t maxVideo = (uint64_t)(g_cfg.clip + 6) * (uint64_t)g_cfg.fps;
         const uint64_t maxAudio = (uint64_t)(g_cfg.clip + 6) * 50;      // 46.9 AAC frames per second per track
-        const uint64_t maxPkts = maxVideo + maxAudio * 3;
+        const uint64_t maxPkts = maxVideo + maxAudio * aud::MAX_TRACKS;
         if (!g_replay.init(slab, g_slabBytes, maxPkts, (int64_t)(g_cfg.clip + 2) * g_cfg.fps)) fatal("Could not allocate the replay index");
         if (!g_mp4.init(maxVideo, maxAudio, g_encW, g_encH, (uint32_t)g_cfg.fps)) fatal("Could not allocate the MP4 index tables");
         g_scratch = (uint8_t*)VirtualAlloc(nullptr, SCRATCH_BYTES, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
@@ -1449,15 +1450,16 @@ int wmain(int argc, wchar_t** argv) {
         ac.pauseEvent = g_cfg.child ? OpenEventW(SYNCHRONIZE, FALSE, ctl::kPauseEvent) : nullptr;
         ac.qpcFreq = g_qpf;
         const int nAudio = aud::start(ac);
+        for (int i = 0; i < aud::MAX_TRACKS; i++) g_mp4.setName(i + 1, aud::kLabels[i]);
         if (nAudio > 0) {
             audioDesc[0] = 0;
-            for (int i = 0; i < nAudio; i++) {
-                g_mp4.setName(i + 1, aud::g_tracks[i].label);
-                if (i) strcat(audioDesc, " + ");
-                strcat(audioDesc, aud::g_tracks[i].label);
+            for (int i = 0; i < aud::MAX_TRACKS; i++) {
+                if (!aud::g_tracks[i].active) continue;
+                if (audioDesc[0]) strcat(audioDesc, " + ");
+                strcat(audioDesc, aud::kLabels[i]);
             }
             strcat(audioDesc, nAudio > 1 ? " sound (separate tracks)" : " sound");
-        }
+        } else strcpy(audioDesc, "no sound yet (the game, Spotify or Discord are not running)");
     }
     const double slabMb = (double)g_slabBytes / 1048576.0;
     const double ramBudget = g_cfg.replay ? 100.0 + slabMb : 150.0;

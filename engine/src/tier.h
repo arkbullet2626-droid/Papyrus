@@ -30,5 +30,5 @@ static inline void papyrusEncodeSize(uint32_t srcW, uint32_t srcH, uint32_t want
 
 // Bytes of RAM the replay buffer slab takes: (clip + 2 s spare) at the target bitrate plus 15 % headroom.
 static inline uint64_t papyrusSlabBytes(int avgMbps, int clipSeconds) {
-    return ((uint64_t)avgMbps * 1000000ull / 8 + 60000) * (uint64_t)(clipSeconds + 2) * 115 / 100;   // + up to 3 audio tracks at 160 kbps
+    return ((uint64_t)avgMbps * 1000000ull / 8 + 80000) * (uint64_t)(clipSeconds + 2) * 115 / 100;   // + up to 4 audio tracks at 160 kbps
 }

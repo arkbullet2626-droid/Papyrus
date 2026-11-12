@@ -1,14 +1,16 @@
 // Papyrus - audio capture and AAC encoding.
 //
-// Up to three tracks, each 48 kHz stereo AAC-LC at 160 kbps:
-//   with a game process:   "Game" (WASAPI process loopback of the game and its child processes)
-//                          "System" (everything else: process loopback excluding the game)
-//   without one:           "System" (classic loopback of the default output device)
-//   optional:              "Microphone" (default recording device)
+// Up to four tracks, each 48 kHz stereo AAC-LC at 160 kbps, each from ONE source only:
+//   "Game"        the game process and its child processes      (WASAPI process loopback)
+//   "Spotify"     Spotify, if it is running                      (WASAPI process loopback)
+//   "Discord"     Discord, if it is running                      (WASAPI process loopback)
+//   "Microphone"  the default recording device, if switched on
+// Nothing else is recorded: browsers, notification sounds and Papyrus's own beeps never reach a clip.
+// Spotify and Discord are picked up when they start and dropped when they exit, without restarting anything.
 //
 // One thread serves all tracks. Every encoded packet is stamped with the time its sound was captured, on the same
 // QueryPerformanceCounter clock the video uses, so a saved clip can line the tracks up exactly.
-// Steady state allocates nothing: the Media Foundation samples and buffers are created once and reused.
+// Steady state allocates nothing: the Media Foundation samples and buffers are created once per track and reused.
 // Any failure here only loses that track - it never stops the video.
 #pragma once
 #include <initguid.h>
@@ -21,6 +23,7 @@
 #include <mferror.h>
 #include <wmcodecdsp.h>
 #include <avrt.h>
+#include <tlhelp32.h>
 #include <cstdint>
 #include <cstring>
 
@@ -37,7 +40,9 @@ extern "C" HRESULT WINAPI ActivateAudioInterfaceAsync(LPCWSTR deviceInterfacePat
 
 namespace aud {
 
-enum { RATE = 48000, CH = 2, FRAME = 1024, MAX_TRACKS = 3, BLOCK_BYTES = FRAME * CH * 2 };
+enum { RATE = 48000, CH = 2, FRAME = 1024, MAX_TRACKS = 4, BLOCK_BYTES = FRAME * CH * 2 };
+enum { SLOT_GAME = 0, SLOT_SPOTIFY = 1, SLOT_DISCORD = 2, SLOT_MIC = 3 };
+static const char* const kLabels[MAX_TRACKS] = { "Game", "Spotify", "Discord", "Microphone" };
 static const int64_t kFrameTime = (int64_t)FRAME * 10000000 / RATE;        // one AAC frame in 100 ns units
 
 // Called on the audio thread for every encoded AAC frame. t = capture time of the frame's first sample (100 ns, QPC clock).
@@ -45,7 +50,7 @@ typedef void (*PacketFn)(int track, const uint8_t* data, uint32_t size, int64_t 
 typedef void (*LogFn)(const char* fmt, ...);
 
 struct Config {
-    DWORD    gamePid = 0;        // 0 = no game: one "System" track with everything
+    DWORD    gamePid = 0;        // 0 = no game track
     bool     mic = false;
     PacketFn onPacket = nullptr;
     LogFn    log = nullptr;
@@ -74,6 +79,9 @@ struct ActivateHandler : IActivateAudioInterfaceCompletionHandler, IAgileObject 
 };
 
 struct Track {
+    bool                 active = false;
+    bool                 failed = false;     // the source went away: close it at the next check
+    HANDLE               proc = nullptr;     // the app this track follows (null for the microphone)
     char                 label[16] = "";
     IAudioClient*        client = nullptr;
     IAudioCaptureClient* cap = nullptr;
@@ -95,7 +103,6 @@ struct Track {
 
 static Config  g_cfg;
 static Track   g_tracks[MAX_TRACKS];
-static int     g_count = 0;                  // tracks that are running
 static HANDLE  g_thread = nullptr, g_stopEv = nullptr, g_readyEv = nullptr;
 
 static inline int64_t now100() {
@@ -261,23 +268,74 @@ static void closeTrack(Track& t) {
     if (t.out) t.out->Release();
     if (t.outBuf) t.outBuf->Release();
     if (t.ev) CloseHandle(t.ev);
+    if (t.proc) CloseHandle(t.proc);
     t = Track{};
 }
 
-static bool addTrack(const char* label, int how, DWORD pid) {      // how: 0 game, 1 everything except the game, 2 output device, 3 microphone
-    Track& t = g_tracks[g_count];
+static int activeCount() {
+    int n = 0;
+    for (int i = 0; i < MAX_TRACKS; i++) if (g_tracks[i].active) n++;
+    return n;
+}
+
+// Opens one slot. pid = the app to follow (process loopback of it and its child processes); 0 = the microphone.
+static bool openSlot(int slot, DWORD pid) {
+    Track& t = g_tracks[slot];
     t = Track{};
-    strncpy(t.label, label, sizeof t.label - 1);
-    const bool ok = how == 0 ? openProcessLoopback(t, pid, true) : how == 1 ? openProcessLoopback(t, pid, false) : openDevice(t, how == 2);
+    strncpy(t.label, kLabels[slot], sizeof t.label - 1);
+    const bool ok = pid ? openProcessLoopback(t, pid, true) : openDevice(t, false);
     if (!ok) { closeTrack(t); return false; }
-    g_count++;
+    if (pid) t.proc = OpenProcess(SYNCHRONIZE, FALSE, pid);
+    t.active = true;
+    if (g_cfg.log) g_cfg.log("  audio: %s track started\n", kLabels[slot]);
     return true;
+}
+
+// The first-started process of an app: the one named `exe` whose parent is not also named `exe`.
+// Following that one with its child processes covers the whole app.
+static DWORD findAppRoot(const wchar_t* const* names, int nNames) {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+    enum { MAXP = 64 };
+    DWORD pids[MAXP], parents[MAXP];
+    int n = 0;
+    PROCESSENTRY32W pe{};
+    pe.dwSize = sizeof pe;
+    if (Process32FirstW(snap, &pe)) {
+        do {
+            for (int k = 0; k < nNames; k++)
+                if (!_wcsicmp(pe.szExeFile, names[k]) && n < MAXP) { pids[n] = pe.th32ProcessID; parents[n] = pe.th32ParentProcessID; n++; break; }
+        } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+    for (int i = 0; i < n; i++) {
+        bool parentIsSameApp = false;
+        for (int j = 0; j < n; j++) if (pids[j] == parents[i]) parentIsSameApp = true;
+        if (!parentIsSameApp) return pids[i];
+    }
+    return 0;
+}
+
+// Starts tracks for apps that have appeared and closes tracks whose app has gone.
+static void scanApps() {
+    static const wchar_t* const spotify[] = { L"Spotify.exe" };
+    static const wchar_t* const discord[] = { L"Discord.exe", L"DiscordPTB.exe", L"DiscordCanary.exe" };
+    for (int i = 0; i < MAX_TRACKS; i++) {
+        Track& t = g_tracks[i];
+        if (t.active && (t.failed || (t.proc && WaitForSingleObject(t.proc, 0) == WAIT_OBJECT_0))) {
+            if (g_cfg.log) g_cfg.log("  audio: %s track ended\n", kLabels[i]);
+            closeTrack(t);
+        }
+    }
+    if (!g_tracks[SLOT_SPOTIFY].active) { const DWORD pid = findAppRoot(spotify, 1); if (pid) openSlot(SLOT_SPOTIFY, pid); }
+    if (!g_tracks[SLOT_DISCORD].active) { const DWORD pid = findAppRoot(discord, 3); if (pid) openSlot(SLOT_DISCORD, pid); }
 }
 
 static void pump(Track& t, int id, bool paused) {
     for (;;) {
         UINT32 next = 0;
-        if (FAILED(t.cap->GetNextPacketSize(&next)) || !next) break;
+        if (FAILED(t.cap->GetNextPacketSize(&next))) { t.failed = true; return; }
+        if (!next) break;
         BYTE* data = nullptr;
         UINT32 frames = 0;
         DWORD flags = 0;
@@ -319,23 +377,24 @@ static DWORD WINAPI threadProc(void*) {
     const bool mf = SUCCEEDED(MFStartup(MF_VERSION, MFSTARTUP_LITE));
     DWORD task = 0;
     HANDLE mm = AvSetMmThreadCharacteristicsW(L"Audio", &task);
-    g_count = 0;
     if (mf) {
-        if (g_cfg.gamePid && addTrack("Game", 0, g_cfg.gamePid)) {
-            if (!addTrack("System", 1, g_cfg.gamePid)) { /* keep the game track alone */ }
-        } else addTrack("System", 2, 0);
-        if (g_cfg.mic && g_count < MAX_TRACKS) addTrack("Microphone", 3, 0);
+        if (g_cfg.gamePid) openSlot(SLOT_GAME, g_cfg.gamePid);
+        scanApps();
+        if (g_cfg.mic) openSlot(SLOT_MIC, 0);
     }
     SetEvent(g_readyEv);
 
-    HANDLE waits[MAX_TRACKS + 1];
-    waits[0] = g_stopEv;
-    for (int i = 0; i < g_count; i++) waits[i + 1] = g_tracks[i].ev;
+    ULONGLONG lastScan = GetTickCount64();
     for (;;) {
-        const DWORD r = WaitForMultipleObjects((DWORD)g_count + 1, waits, FALSE, 20);
+        HANDLE waits[MAX_TRACKS + 1];
+        DWORD n = 0;
+        waits[n++] = g_stopEv;
+        for (int i = 0; i < MAX_TRACKS; i++) if (g_tracks[i].active) waits[n++] = g_tracks[i].ev;
+        const DWORD r = WaitForMultipleObjects(n, waits, FALSE, 20);
         if (r == WAIT_OBJECT_0 || r == WAIT_FAILED) break;
         const bool paused = g_cfg.pauseEvent && WaitForSingleObject(g_cfg.pauseEvent, 0) == WAIT_OBJECT_0;
-        for (int i = 0; i < g_count; i++) pump(g_tracks[i], i, paused);
+        for (int i = 0; i < MAX_TRACKS; i++) if (g_tracks[i].active && !g_tracks[i].failed) pump(g_tracks[i], i, paused);
+        if (mf && GetTickCount64() - lastScan > 3000) { lastScan = GetTickCount64(); scanApps(); }
     }
     for (int i = 0; i < MAX_TRACKS; i++) closeTrack(g_tracks[i]);
     if (mm) AvRevertMmThreadCharacteristics(mm);
@@ -344,7 +403,7 @@ static DWORD WINAPI threadProc(void*) {
     return 0;
 }
 
-// Starts audio capture. Returns the number of tracks running (0 = no sound); labels are in g_tracks[i].label.
+// Starts audio capture. Returns the number of tracks running right now; more can appear later (see scanApps).
 static int start(const Config& cfg) {
     g_cfg = cfg;
     g_stopEv = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -352,7 +411,7 @@ static int start(const Config& cfg) {
     g_thread = CreateThread(nullptr, 0, threadProc, nullptr, 0, nullptr);
     if (!g_thread) return 0;
     WaitForSingleObject(g_readyEv, 8000);
-    return g_count;
+    return activeCount();
 }
 
 static void stop() {

@@ -35,7 +35,7 @@ The video is HEVC (H.265). VLC plays it directly; Windows' own players need the 
 
 - Capture: Windows Graphics Capture. No hooks, no DLL injection.
 - Colour conversion on the GPU, encoding on the card's NVENC block. A raw frame never leaves the GPU.
-- Sound is captured with WASAPI (the game on its own track, everything else on another, optional microphone) and encoded to AAC.
+- Sound is captured per app with WASAPI: the game, Spotify, Discord and an optional microphone each get their own AAC track. No other app is recorded.
 - Only compressed packets are buffered, in one pre-allocated block of RAM.
 - Saving a clip copies packets into an MP4 without re-encoding.
 - No network connections, no telemetry, no accounts.

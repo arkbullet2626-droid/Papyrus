@@ -1,4 +1,4 @@
-// Papyrus - small self-contained MP4 writer: one HEVC video track plus up to 3 AAC audio tracks (no third-party code).
+// Papyrus - small self-contained MP4 writer: one HEVC video track plus up to 4 AAC audio tracks (no third-party code).
 //
 // Two ways to use it, both without any allocation after init():
 //   streaming (manual recording):  ftyp | mdat (frames as they arrive) | moov (index, written at the end)
@@ -62,7 +62,7 @@ static inline uint32_t hevcToLengthPrefixed(const uint8_t* p, uint32_t n, HevcPa
 }
 
 struct Mp4Mux {
-    enum { FTYP_LEN = 28, MDAT_HDR_LEN = 16, MAX_TRACKS = 4, AUDIO_RATE = 48000, AUDIO_FRAME = 1024 };
+    enum { FTYP_LEN = 28, MDAT_HDR_LEN = 16, MAX_TRACKS = 5, AUDIO_RATE = 48000, AUDIO_FRAME = 1024 };
 
     // Track 0 is video. Tracks 1.. are audio. Every sample is its own chunk, so samples of different tracks can
     // sit in the file in any order (they are stored in the order they were recorded).
