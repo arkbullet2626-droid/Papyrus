@@ -17,17 +17,25 @@ namespace ctl {
 
 static const wchar_t* const kStopEvent = L"Local\\Papyrus.Worker.Stop";
 static const wchar_t* const kSaveEvent = L"Local\\Papyrus.Worker.Save";
+static const wchar_t* const kPauseEvent = L"Local\\Papyrus.Worker.Pause";   // set = do not record right now
 static const wchar_t* const kWndClass  = L"PapyrusControl";
 static const wchar_t* const kMutex     = L"PapyrusControllerMutex";
 
-enum { IDC_TOGGLE = 101, IDC_ALWAYS, IDC_SAVE, IDC_OPEN, IDC_HOTKEY, IDC_LEN, IDC_FPS, IDC_QUAL, IDM_SHOW = 201, IDM_EXIT };
+enum { IDC_TOGGLE = 101, IDC_ALWAYS, IDC_SAVE, IDC_OPEN, IDC_HOTKEY, IDC_LEN, IDC_FPS, IDC_QUAL, IDC_MODE, IDM_SHOW = 201, IDM_EXIT };
 enum { WM_TRAY = WM_APP + 1, WM_SHOWME = WM_APP + 2, TIMER_WATCH = 1 };
 
-static HWND   g_wnd, g_toggle, g_always, g_save, g_open, g_status, g_hotkey, g_len, g_fps, g_qual, g_est;
+static HWND   g_wnd, g_toggle, g_always, g_save, g_open, g_status, g_hotkey, g_len, g_fps, g_qual, g_est, g_mode;
 
 // Settings (settings.ini)
 static UINT s_vk = VK_F9, s_mods = MOD_CONTROL | MOD_SHIFT;
 static int  s_clip = 30, s_fps = 120, s_height = 2160;
+static int  s_mode = 0;                 // 0 = fullscreen apps and games only, 1 = whole screen
+static bool g_armed, g_paused;          // armed = the user switched the buffer on; the recorder may still be waiting
+static ULONGLONG g_pausedSince;
+static HANDLE g_evPause;
+static HICON  g_icoWait;
+static int    g_trayState = -1;
+enum { PAUSE_STOP_AFTER_MS = 5 * 60 * 1000 };   // paused this long -> shut the recorder down and free its memory
 static bool g_hotkeyOk;
 static wchar_t g_workerLine[200];
 static const int kClips[] = { 15, 30, 60, 90, 120 };
@@ -104,6 +112,7 @@ static void loadSettings() {
     s_clip = (int)GetPrivateProfileIntW(L"papyrus", L"clip_seconds", 30, g_ini);
     s_fps = (int)GetPrivateProfileIntW(L"papyrus", L"fps", 120, g_ini);
     s_height = (int)GetPrivateProfileIntW(L"papyrus", L"quality_height", 2160, g_ini);
+    s_mode = GetPrivateProfileIntW(L"papyrus", L"capture_mode", 0, g_ini) == 1 ? 1 : 0;
     if (!s_vk) { s_vk = VK_F9; s_mods = MOD_CONTROL | MOD_SHIFT; }
     if (s_clip < 15 || s_clip > 120) s_clip = 30;
     if (s_fps != 120 && s_fps != 60 && s_fps != 30) s_fps = 120;
@@ -116,7 +125,7 @@ static void saveInt(const wchar_t* key, int v) {
 }
 static void saveSettings() {
     saveInt(L"hotkey_vk", (int)s_vk); saveInt(L"hotkey_mods", (int)s_mods);
-    saveInt(L"clip_seconds", s_clip); saveInt(L"fps", s_fps); saveInt(L"quality_height", s_height);
+    saveInt(L"clip_seconds", s_clip); saveInt(L"fps", s_fps); saveInt(L"quality_height", s_height); saveInt(L"capture_mode", s_mode);
 }
 
 static void registerHotkey(bool on) {
@@ -152,31 +161,20 @@ static void readSmallFile(const wchar_t* path, wchar_t* out, int cap) {
 }
 
 static void setTray(DWORD action) {
-    g_nid.hIcon = workerOn() ? g_icoOn : g_icoOff;
-    swprintf(g_nid.szTip, 128, L"Papyrus - replay buffer %ls", workerOn() ? L"ON" : L"OFF");
+    const int state = !g_armed ? 0 : (workerOn() && !g_paused) ? 2 : 1;
+    if (action == NIM_MODIFY && state == g_trayState) return;
+    g_trayState = state;
+    g_nid.hIcon = state == 2 ? g_icoOn : state == 1 ? g_icoWait : g_icoOff;
+    swprintf(g_nid.szTip, 128, L"Papyrus - replay buffer %ls", state == 2 ? L"ON, recording" : state == 1 ? L"ON, waiting for a fullscreen app" : L"OFF");
     g_nid.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE;
     Shell_NotifyIconW(action, &g_nid);
 }
 
-static void updateUi(const wchar_t* status);
-
-// Status line while the buffer is on: what the recorder reports plus how to save.
-static void refreshOnStatus() {
-    wchar_t hk[64], len[32], t[400];
-    hotkeyName(hk, 64);
-    clipName(len, 32);
-    const wchar_t* first = g_workerLine[0] ? g_workerLine : L"Starting...";
-    if (g_hotkeyOk) swprintf(t, 400, L"%ls Press %ls to save the last %ls (high beep = saved).", first, hk, len);
-    else swprintf(t, 400, L"%ls Another program already uses %ls - pick a different hotkey below, or use Save clip now.", first, hk);
-    updateUi(t);
-}
-
 static void updateUi(const wchar_t* status) {
-    const bool on = workerOn();
-    SetWindowTextW(g_toggle, on ? L"Replay buffer is ON      (click to turn off)" : L"Replay buffer is OFF      (click to turn on)");
-    SendMessageW(g_toggle, BM_SETCHECK, on ? BST_CHECKED : BST_UNCHECKED, 0);
+    SetWindowTextW(g_toggle, g_armed ? L"Replay buffer is ON      (click to turn off)" : L"Replay buffer is OFF      (click to turn on)");
+    SendMessageW(g_toggle, BM_SETCHECK, g_armed ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(g_always, BM_SETCHECK, g_alwaysOn ? BST_CHECKED : BST_UNCHECKED, 0);
-    EnableWindow(g_save, on);
+    EnableWindow(g_save, workerOn());
     if (status && wcscmp(status, g_lastStatus) != 0) {
         wcsncpy(g_lastStatus, status, 399);
         SetWindowTextW(g_status, status);
@@ -184,10 +182,44 @@ static void updateUi(const wchar_t* status) {
     setTray(NIM_MODIFY);
 }
 
-static void startWorker() {
-    if (workerOn()) return;
+// The status line for the current state.
+static void refreshStatus() {
+    if (!g_armed) { updateUi(L"The replay buffer is off. Nothing is being recorded."); return; }
+    wchar_t hk[64], len[32], save[200], t[400];
+    hotkeyName(hk, 64);
+    clipName(len, 32);
+    if (g_hotkeyOk) swprintf(save, 200, L"Press %ls to save the last %ls (high beep = saved).", hk, len);
+    else swprintf(save, 200, L"Another program already uses %ls - pick a different hotkey below, or use Save clip now.", hk);
+    if (!workerOn()) swprintf(t, 400, L"Waiting for a fullscreen app or game. Nothing is being recorded until one is in front.");
+    else if (g_paused) swprintf(t, 400, L"Paused - no fullscreen app is in front. What was recorded is still in the buffer. %ls", save);
+    else swprintf(t, 400, L"%ls %ls", g_workerLine[0] ? g_workerLine : L"Starting...", save);
+    updateUi(t);
+}
+
+// True when the window in front covers the whole main monitor without a title bar (a game or a fullscreen app).
+static bool fullscreenAppInFront() {
+    HWND fg = GetForegroundWindow();
+    if (!fg || fg == g_wnd || IsIconic(fg) || !IsWindowVisible(fg)) return false;
+    wchar_t cls[64] = L"";
+    GetClassNameW(fg, cls, 64);
+    if (!wcscmp(cls, L"Progman") || !wcscmp(cls, L"WorkerW") || !wcscmp(cls, L"Shell_TrayWnd")) return false;     // the desktop itself
+    HMONITOR mon = MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST);
+    if (mon != MonitorFromPoint(POINT{ 0, 0 }, MONITOR_DEFAULTTOPRIMARY)) return false;                       // Papyrus records the main monitor
+    MONITORINFO mi{};
+    mi.cbSize = sizeof mi;
+    RECT r;
+    if (!GetMonitorInfoW(mon, &mi) || !GetWindowRect(fg, &r)) return false;
+    const bool covers = r.left <= mi.rcMonitor.left && r.top <= mi.rcMonitor.top && r.right >= mi.rcMonitor.right && r.bottom >= mi.rcMonitor.bottom;
+    const bool hasTitleBar = (GetWindowLongW(fg, GWL_STYLE) & WS_CAPTION) == WS_CAPTION;
+    return covers && !hasTitleBar;
+}
+
+static bool startWorker() {
+    if (workerOn()) return true;
     ResetEvent(g_evStop);
     ResetEvent(g_evSave);
+    ResetEvent(g_evPause);
+    g_paused = false;
     DeleteFileW(g_err);
     DeleteFileW(g_stat);
     wchar_t cmd[MAX_PATH + 160];
@@ -199,14 +231,15 @@ static void startWorker() {
     if (!CreateProcessW(nullptr, cmd, nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
         wchar_t msg[160];
         swprintf(msg, 160, L"Could not start the recorder (Windows error %lu).", GetLastError());
+        g_armed = false;
+        UnregisterHotKey(g_wnd, 1);
         updateUi(msg);
-        return;
+        return false;
     }
     CloseHandle(pi.hThread);
     g_worker = pi.hProcess;
     g_workerLine[0] = 0;
-    registerHotkey(true);
-    refreshOnStatus();
+    return true;
 }
 
 static void stopWorker() {
@@ -215,15 +248,35 @@ static void stopWorker() {
     if (WaitForSingleObject(g_worker, 8000) != WAIT_OBJECT_0) TerminateProcess(g_worker, 1);
     CloseHandle(g_worker);
     g_worker = nullptr;
-    registerHotkey(false);
-    updateUi(L"The replay buffer is off. Nothing is being recorded.");
+    g_paused = false;
+}
+
+// Decides what the recorder should be doing right now. Called twice a second and after every change.
+static void evaluate() {
+    if (!g_armed) { stopWorker(); refreshStatus(); return; }
+    const bool want = s_mode == 1 || fullscreenAppInFront();
+    if (want) {
+        if (!workerOn()) { if (!startWorker()) return; }
+        else if (g_paused) { ResetEvent(g_evPause); g_paused = false; }
+    } else if (workerOn()) {
+        if (!g_paused) { SetEvent(g_evPause); g_paused = true; g_pausedSince = GetTickCount64(); }
+        else if (GetTickCount64() - g_pausedSince > PAUSE_STOP_AFTER_MS) stopWorker();
+    }
+    refreshStatus();
+}
+
+static void arm(bool on) {
+    g_armed = on;
+    registerHotkey(on);
+    evaluate();
 }
 
 // A setting that the recorder reads at start-up changed: restart it if it is running.
 static void settingsChanged() {
     saveSettings();
     updateEstimate();
-    if (workerOn()) { stopWorker(); startWorker(); }
+    stopWorker();
+    evaluate();
 }
 
 static void setAlwaysOn(bool on) {
@@ -247,14 +300,16 @@ static void showWindow() {
 
 static void quit() {
     g_exiting = true;
+    g_armed = false;
     stopWorker();
+    UnregisterHotKey(g_wnd, 1);
     Shell_NotifyIconW(NIM_DELETE, &g_nid);
     DestroyWindow(g_wnd);
 }
 
 static void trayMenu() {
     HMENU m = CreatePopupMenu();
-    AppendMenuW(m, MF_STRING | (workerOn() ? MF_CHECKED : 0), IDC_TOGGLE, L"Replay buffer on");
+    AppendMenuW(m, MF_STRING | (g_armed ? MF_CHECKED : 0), IDC_TOGGLE, L"Replay buffer on");
     AppendMenuW(m, MF_STRING | (g_alwaysOn ? MF_CHECKED : 0), IDC_ALWAYS, L"Always on (start with Windows)");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING | (workerOn() ? 0 : MF_GRAYED), IDC_SAVE, L"Save clip now");
@@ -283,6 +338,7 @@ static LRESULT CALLBACK wndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             if (LOWORD(wp) == IDC_LEN && s_clip != kClips[sel]) { s_clip = kClips[sel]; settingsChanged(); }
             else if (LOWORD(wp) == IDC_FPS && s_fps != kFps[sel]) { s_fps = kFps[sel]; settingsChanged(); }
             else if (LOWORD(wp) == IDC_QUAL && s_height != kHeights[sel]) { s_height = kHeights[sel]; settingsChanged(); }
+            else if (LOWORD(wp) == IDC_MODE && s_mode != sel) { s_mode = sel; saveSettings(); evaluate(); }
             return 0;
         }
         if (LOWORD(wp) == IDC_HOTKEY) {
@@ -293,13 +349,13 @@ static LRESULT CALLBACK wndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 if (vk && vk != VK_SHIFT && vk != VK_CONTROL && vk != VK_MENU && (vk != s_vk || mods != s_mods)) {
                     s_vk = vk; s_mods = mods;
                     saveSettings();
-                    if (workerOn()) { registerHotkey(true); refreshOnStatus(); }
+                    if (g_armed) { registerHotkey(true); refreshStatus(); }
                 }
             }
             return 0;
         }
         switch (LOWORD(wp)) {
-        case IDC_TOGGLE: if (workerOn()) stopWorker(); else startWorker(); return 0;
+        case IDC_TOGGLE: arm(!g_armed); return 0;
         case IDC_ALWAYS: setAlwaysOn(!g_alwaysOn); updateUi(nullptr); return 0;
         case IDC_SAVE:   if (workerOn()) SetEvent(g_evSave); return 0;
         case IDC_OPEN:   ShellExecuteW(nullptr, L"open", g_out, nullptr, nullptr, SW_SHOWNORMAL); return 0;
@@ -315,20 +371,21 @@ static LRESULT CALLBACK wndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         showWindow();
         return 0;
     case WM_TIMER:
-        if (wp == TIMER_WATCH && workerOn()) {
-            if (WaitForSingleObject(g_worker, 0) == WAIT_OBJECT_0) {         // the recorder stopped by itself
+        if (wp == TIMER_WATCH) {
+            if (workerOn() && WaitForSingleObject(g_worker, 0) == WAIT_OBJECT_0) {      // the recorder stopped by itself
                 CloseHandle(g_worker);
                 g_worker = nullptr;
+                g_armed = false;
+                g_paused = false;
+                UnregisterHotKey(w, 1);
                 wchar_t err[400], msg[480];
                 readSmallFile(g_err, err, 400);
                 swprintf(msg, 480, L"The recorder stopped: %ls", err[0] ? err : L"unknown reason - see the log folder.");
                 updateUi(msg);
                 showWindow();
-            } else {
-                if (!g_workerLine[0]) {
-                    readSmallFile(g_stat, g_workerLine, 200);
-                    if (g_workerLine[0]) refreshOnStatus();
-                }
+            } else if (g_armed) {
+                if (workerOn() && !g_workerLine[0]) readSmallFile(g_stat, g_workerLine, 200);
+                evaluate();
             }
         }
         return 0;
@@ -383,12 +440,14 @@ static int run(bool startHidden, const wchar_t* outDir, const wchar_t* dataDir, 
     InitCommonControlsEx(&icc);
     g_evStop = CreateEventW(nullptr, TRUE, FALSE, kStopEvent);
     g_evSave = CreateEventW(nullptr, FALSE, FALSE, kSaveEvent);
+    g_evPause = CreateEventW(nullptr, TRUE, FALSE, kPauseEvent);
 
     g_dpi = (int)GetDpiForSystem();
     g_font = CreateFontW(-S(14), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
     g_fontBig = CreateFontW(-S(22), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
     g_icoOn = makeIcon(RGB(230, 40, 40));
     g_icoOff = makeIcon(RGB(140, 140, 140));
+    g_icoWait = makeIcon(RGB(240, 170, 30));
 
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof wc;
@@ -402,7 +461,7 @@ static int run(bool startHidden, const wchar_t* outDir, const wchar_t* dataDir, 
     RegisterClassExW(&wc);
 
     const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-    RECT rc{ 0, 0, S(440), S(524) };
+    RECT rc{ 0, 0, S(440), S(560) };
     AdjustWindowRectEx(&rc, style, FALSE, 0);
     const int ww = rc.right - rc.left, wh = rc.bottom - rc.top;
     g_wnd = CreateWindowExW(0, kWndClass, L"Papyrus", style, (GetSystemMetrics(SM_CXSCREEN) - ww) / 2, (GetSystemMetrics(SM_CYSCREEN) - wh) / 2,
@@ -414,33 +473,38 @@ static int run(bool startHidden, const wchar_t* outDir, const wchar_t* dataDir, 
     g_toggle = mk(L"BUTTON", L"", BS_AUTOCHECKBOX | BS_PUSHLIKE | WS_TABSTOP, 20, 56, 400, 46, IDC_TOGGLE, g_font);
     g_status = mk(L"STATIC", L"", 0, 20, 110, 400, 58, 0, g_font);
 
-    mk(L"STATIC", L"Save hotkey", 0, 20, 180, 150, 22, 0, g_font);
-    g_hotkey = mk(HOTKEY_CLASSW, L"", WS_BORDER | WS_TABSTOP, 180, 176, 240, 26, IDC_HOTKEY, g_font);
+    mk(L"STATIC", L"Record", 0, 20, 180, 150, 22, 0, g_font);
+    g_mode = mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 180, 176, 240, 220, IDC_MODE, g_font);
+    SendMessageW(g_mode, CB_ADDSTRING, 0, (LPARAM)L"Fullscreen apps and games only");
+    SendMessageW(g_mode, CB_ADDSTRING, 0, (LPARAM)L"Whole screen (desktop too)");
+    SendMessageW(g_mode, CB_SETCURSEL, s_mode, 0);
+    mk(L"STATIC", L"Save hotkey", 0, 20, 214, 150, 22, 0, g_font);
+    g_hotkey = mk(HOTKEY_CLASSW, L"", WS_BORDER | WS_TABSTOP, 180, 210, 240, 26, IDC_HOTKEY, g_font);
     SendMessageW(g_hotkey, HKM_SETRULES, HKCOMB_NONE | HKCOMB_S, MAKELPARAM(HOTKEYF_CONTROL | HOTKEYF_SHIFT, 0));
     SendMessageW(g_hotkey, HKM_SETHOTKEY, MAKEWORD(s_vk, ((s_mods & MOD_SHIFT) ? HOTKEYF_SHIFT : 0) | ((s_mods & MOD_CONTROL) ? HOTKEYF_CONTROL : 0) |
                                                          ((s_mods & MOD_ALT) ? HOTKEYF_ALT : 0)), 0);
-    mk(L"STATIC", L"Clip length", 0, 20, 214, 150, 22, 0, g_font);
-    g_len = mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 180, 210, 240, 220, IDC_LEN, g_font);
+    mk(L"STATIC", L"Clip length", 0, 20, 248, 150, 22, 0, g_font);
+    g_len = mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 180, 244, 240, 220, IDC_LEN, g_font);
     for (int i = 0; i < 5; i++) { SendMessageW(g_len, CB_ADDSTRING, 0, (LPARAM)kClipNames[i]); if (kClips[i] == s_clip) SendMessageW(g_len, CB_SETCURSEL, i, 0); }
-    mk(L"STATIC", L"Frame rate", 0, 20, 248, 150, 22, 0, g_font);
-    g_fps = mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 180, 244, 240, 220, IDC_FPS, g_font);
+    mk(L"STATIC", L"Frame rate", 0, 20, 282, 150, 22, 0, g_font);
+    g_fps = mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 180, 278, 240, 220, IDC_FPS, g_font);
     for (int i = 0; i < 3; i++) {
         wchar_t t[16]; swprintf(t, 16, L"%d fps", kFps[i]);
         SendMessageW(g_fps, CB_ADDSTRING, 0, (LPARAM)t);
         if (kFps[i] == s_fps) SendMessageW(g_fps, CB_SETCURSEL, i, 0);
     }
-    mk(L"STATIC", L"Quality", 0, 20, 282, 150, 22, 0, g_font);
-    g_qual = mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 180, 278, 240, 220, IDC_QUAL, g_font);
+    mk(L"STATIC", L"Quality", 0, 20, 316, 150, 22, 0, g_font);
+    g_qual = mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 180, 312, 240, 220, IDC_QUAL, g_font);
     for (int i = 0; i < 5; i++) { SendMessageW(g_qual, CB_ADDSTRING, 0, (LPARAM)kHeightNames[i]); if (kHeights[i] == s_height) SendMessageW(g_qual, CB_SETCURSEL, i, 0); }
-    g_est = mk(L"STATIC", L"", 0, 20, 314, 400, 40, 0, g_font);
+    g_est = mk(L"STATIC", L"", 0, 20, 348, 400, 40, 0, g_font);
     updateEstimate();
 
     g_always = mk(L"BUTTON", L"Always on: start Papyrus when Windows starts and turn the replay buffer on", BS_AUTOCHECKBOX | BS_MULTILINE | BS_TOP | WS_TABSTOP,
-                  20, 362, 400, 40, IDC_ALWAYS, g_font);
-    g_save = mk(L"BUTTON", L"Save clip now", BS_PUSHBUTTON | WS_TABSTOP, 20, 410, 194, 34, IDC_SAVE, g_font);
-    g_open = mk(L"BUTTON", L"Open clips folder", BS_PUSHBUTTON | WS_TABSTOP, 226, 410, 194, 34, IDC_OPEN, g_font);
-    mk(L"STATIC", L"Changing clip length, frame rate or quality while the buffer is on restarts it. Closing this window keeps Papyrus in the tray near the clock; right-click its icon to exit.",
-       0, 20, 454, 400, 62, 0, g_font);
+                  20, 396, 400, 40, IDC_ALWAYS, g_font);
+    g_save = mk(L"BUTTON", L"Save clip now", BS_PUSHBUTTON | WS_TABSTOP, 20, 444, 194, 34, IDC_SAVE, g_font);
+    g_open = mk(L"BUTTON", L"Open clips folder", BS_PUSHBUTTON | WS_TABSTOP, 226, 444, 194, 34, IDC_OPEN, g_font);
+    mk(L"STATIC", L"Changing clip length, frame rate or quality while recording restarts the buffer. Closing this window keeps Papyrus in the tray near the clock; right-click its icon to exit.",
+       0, 20, 488, 400, 62, 0, g_font);
 
     g_nid.cbSize = sizeof g_nid;
     g_nid.hWnd = g_wnd;
@@ -450,8 +514,8 @@ static int run(bool startHidden, const wchar_t* outDir, const wchar_t* dataDir, 
     setTray(NIM_ADD);
     SetTimer(g_wnd, TIMER_WATCH, 500, nullptr);
 
-    updateUi(L"The replay buffer is off. Nothing is being recorded.");
-    if (g_alwaysOn) startWorker();
+    refreshStatus();
+    if (g_alwaysOn) arm(true);
     if (!startHidden) showWindow();
 
     MSG m;

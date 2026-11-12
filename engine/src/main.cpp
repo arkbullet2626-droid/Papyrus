@@ -197,6 +197,7 @@ static ReplayRing       g_replay;
 static CRITICAL_SECTION g_replayLock;
 static uint64_t         g_slabBytes = 0;
 static HANDLE           g_evSave = nullptr;
+static HANDLE           g_evPause = nullptr;    // worker: set by the control window while nothing should be recorded
 static std::atomic<bool>     g_saveQuit{false};
 static std::atomic<uint64_t> a_clipsSaved{0}, a_clipsFailed{0};
 static wchar_t          g_outDir[MAX_PATH] = L"";
@@ -738,6 +739,8 @@ static DWORD WINAPI captureThread(void*) {
     bool first = true;
     wgc::IDirect3D11CaptureFrame* pending[2] = {};
     int nPending = 0;
+    bool resumeIdr = false;
+    uint64_t framesSubmitted = 0;                        // clip timeline: counts encoded frames, so a pause leaves no gap
 
     for (uint64_t k = 0; k < total && !g_stop.load(); k++) {
         const int64_t due = t0 + (int64_t)(k * (uint64_t)g_qpf / (uint64_t)g_cfg.fps);
@@ -763,6 +766,9 @@ static DWORD WINAPI captureThread(void*) {
             if (nPending == 2) { closeFrame(pending[0]); pending[0] = pending[1]; nPending = 1; a_srcSkipped++; }
             pending[nPending++] = f;
         }
+        // Paused by the control window (no fullscreen app in front): keep the capture fresh but encode nothing.
+        // The buffer keeps what it has; the first frame after the pause is a keyframe so the cut is clean.
+        if (g_evPause && WaitForSingleObject(g_evPause, 0) == WAIT_OBJECT_0) { resumeIdr = true; continue; }
         if (nPending) {
             closeFrame(held);
             held = pending[0];
@@ -806,8 +812,9 @@ static DWORD WINAPI captureThread(void*) {
         pp.outputBitstream = g_bs[idx];
         pp.completionEvent = g_async ? g_ev[idx] : nullptr;
         pp.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
-        pp.inputTimeStamp = k;
+        pp.inputTimeStamp = framesSubmitted++;
         pp.inputDuration = 1;
+        if (resumeIdr) { pp.encodePicFlags = NV_ENC_PIC_FLAG_FORCEIDR; resumeIdr = false; }
         g_submitQpc[idx] = qpc();
         NVENCSTATUS st = g_nv.nvEncEncodePicture(g_enc, &pp);
         if (st != NV_ENC_SUCCESS && st != NV_ENC_ERR_NEED_MORE_INPUT) nvcheck(st, "EncodePicture");
@@ -1468,6 +1475,7 @@ int wmain(int argc, wchar_t** argv) {
     if (g_cfg.child) {
         hCtlStop = OpenEventW(SYNCHRONIZE, FALSE, ctl::kStopEvent);
         hCtlSave = OpenEventW(SYNCHRONIZE, FALSE, ctl::kSaveEvent);
+        g_evPause = OpenEventW(SYNCHRONIZE, FALSE, ctl::kPauseEvent);
         if (g_cfg.parentPid) hParent = OpenProcess(SYNCHRONIZE, FALSE, g_cfg.parentPid);
     }
     // Waits `ms`, handling the save hotkey meanwhile. Returns true when the capture thread has finished.
