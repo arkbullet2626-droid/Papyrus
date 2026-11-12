@@ -49,4 +49,4 @@ Name: "{group}\Uninstall Papyrus"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\Papyrus"; Filename: "{app}\papyrus-engine.exe"; Parameters: "--replay --pause"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\papyrus-engine.exe"; Parameters: "--replay --pause"; Description: "Start Papyrus now"; Flags: postinstall nowait skipifsilent unchecked
+Filename: "{app}\papyrus-engine.exe"; Parameters: "--replay --pause"; Description: "Start Papyrus now"; Flags: postinstall nowait skipifsilent
