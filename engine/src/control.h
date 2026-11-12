@@ -9,6 +9,7 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <commctrl.h>
+#include <dwmapi.h>
 #include "tier.h"
 #include <cstdio>
 #include <cwchar>
@@ -190,28 +191,61 @@ static void refreshStatus() {
     clipName(len, 32);
     if (g_hotkeyOk) swprintf(save, 200, L"Press %ls to save the last %ls (high beep = saved).", hk, len);
     else swprintf(save, 200, L"Another program already uses %ls - pick a different hotkey below, or use Save clip now.", hk);
-    if (!workerOn()) swprintf(t, 400, L"Waiting for a fullscreen app or game. Nothing is being recorded until one is in front.");
-    else if (g_paused) swprintf(t, 400, L"Paused - no fullscreen app is in front. What was recorded is still in the buffer. %ls", save);
+    if (!workerOn()) swprintf(t, 400, L"Waiting for a fullscreen app or game. Nothing is being recorded until one is running.");
+    else if (g_paused) swprintf(t, 400, L"Paused - the fullscreen app has closed. What was recorded is still in the buffer for 5 minutes. %ls", save);
     else swprintf(t, 400, L"%ls %ls", g_workerLine[0] ? g_workerLine : L"Starting...", save);
     updateUi(t);
 }
 
-// True when the window in front covers the whole main monitor without a title bar (a game or a fullscreen app).
-static bool fullscreenAppInFront() {
-    HWND fg = GetForegroundWindow();
-    if (!fg || fg == g_wnd || IsIconic(fg) || !IsWindowVisible(fg)) return false;
-    wchar_t cls[64] = L"";
-    GetClassNameW(fg, cls, 64);
-    if (!wcscmp(cls, L"Progman") || !wcscmp(cls, L"WorkerW") || !wcscmp(cls, L"Shell_TrayWnd")) return false;     // the desktop itself
-    HMONITOR mon = MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST);
-    if (mon != MonitorFromPoint(POINT{ 0, 0 }, MONITOR_DEFAULTTOPRIMARY)) return false;                       // Papyrus records the main monitor
+// --- Fullscreen app detection -------------------------------------------------------------------------------
+static HWND g_appWnd;      // the fullscreen app or game we are recording for (kept while it is tabbed out)
+
+static bool coversMainMonitor(HWND w) {
+    HMONITOR mon = MonitorFromWindow(w, MONITOR_DEFAULTTONEAREST);
+    if (mon != MonitorFromPoint(POINT{ 0, 0 }, MONITOR_DEFAULTTOPRIMARY)) return false;      // Papyrus records the main monitor
     MONITORINFO mi{};
     mi.cbSize = sizeof mi;
     RECT r;
-    if (!GetMonitorInfoW(mon, &mi) || !GetWindowRect(fg, &r)) return false;
-    const bool covers = r.left <= mi.rcMonitor.left && r.top <= mi.rcMonitor.top && r.right >= mi.rcMonitor.right && r.bottom >= mi.rcMonitor.bottom;
-    const bool hasTitleBar = (GetWindowLongW(fg, GWL_STYLE) & WS_CAPTION) == WS_CAPTION;
-    return covers && !hasTitleBar;
+    if (!GetMonitorInfoW(mon, &mi) || !GetWindowRect(w, &r)) return false;
+    return r.left <= mi.rcMonitor.left && r.top <= mi.rcMonitor.top && r.right >= mi.rcMonitor.right && r.bottom >= mi.rcMonitor.bottom;
+}
+
+// A real application window that fills the main monitor and has no title bar: a game (fullscreen or borderless)
+// or an app in fullscreen mode. Overlays, the desktop and hidden windows do not count.
+static bool isFullscreenApp(HWND w) {
+    if (!w || w == g_wnd || !IsWindowVisible(w) || IsIconic(w)) return false;
+    const LONG ex = GetWindowLongW(w, GWL_EXSTYLE);
+    if (ex & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT)) return false;        // overlays and helper windows
+    if ((GetWindowLongW(w, GWL_STYLE) & WS_CAPTION) == WS_CAPTION) return false;             // has a title bar: an ordinary window
+    if (GetWindow(w, GW_OWNER)) return false;
+    wchar_t cls[64] = L"";
+    GetClassNameW(w, cls, 64);
+    if (!wcscmp(cls, L"Progman") || !wcscmp(cls, L"WorkerW") || !wcscmp(cls, L"Shell_TrayWnd")) return false;   // the desktop itself
+    BOOL cloaked = FALSE;
+    if (SUCCEEDED(DwmGetWindowAttribute(w, DWMWA_CLOAKED, &cloaked, sizeof cloaked)) && cloaked) return false;
+    if (GetWindowTextLengthW(w) == 0) return false;
+    return coversMainMonitor(w);
+}
+
+static BOOL CALLBACK findFullscreenProc(HWND w, LPARAM out) {
+    if (isFullscreenApp(w)) { *(HWND*)out = w; return FALSE; }
+    return TRUE;
+}
+
+// True while a fullscreen app or game exists, whether it is in front or tabbed out:
+//   - any fullscreen app window on the main monitor, in front or behind other windows (borderless games stay like that), or
+//   - the one we were already recording for, now minimised (what an exclusive-fullscreen game does when you alt-tab).
+static bool fullscreenAppRunning() {
+    HWND fg = GetForegroundWindow();
+    if (isFullscreenApp(fg)) { g_appWnd = fg; return true; }
+    if (g_appWnd) {
+        if (IsWindow(g_appWnd) && (IsIconic(g_appWnd) || isFullscreenApp(g_appWnd))) return true;
+        g_appWnd = nullptr;                                                                  // it closed or left fullscreen
+    }
+    HWND found = nullptr;
+    EnumWindows(findFullscreenProc, (LPARAM)&found);
+    if (found) { g_appWnd = found; return true; }
+    return false;
 }
 
 static bool startWorker() {
@@ -254,7 +288,7 @@ static void stopWorker() {
 // Decides what the recorder should be doing right now. Called twice a second and after every change.
 static void evaluate() {
     if (!g_armed) { stopWorker(); refreshStatus(); return; }
-    const bool want = s_mode == 1 || fullscreenAppInFront();
+    const bool want = s_mode == 1 || fullscreenAppRunning();
     if (want) {
         if (!workerOn()) { if (!startWorker()) return; }
         else if (g_paused) { ResetEvent(g_evPause); g_paused = false; }

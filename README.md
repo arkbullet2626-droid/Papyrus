@@ -17,7 +17,7 @@ The installer is not code-signed yet, so Windows SmartScreen shows "Windows prot
 1. Open **Papyrus** from the Start menu. The replay buffer starts **off**.
 2. Click the big button to turn the replay buffer on. Click it again to turn it off.
 3. While it is on, press **Ctrl+Shift+F9** (or click **Save clip now**) to save the last 30 seconds. High beep = saved, low beep = failed.
-4. Choose what to record: **Fullscreen apps and games only** (default; nothing is recorded on the desktop) or **Whole screen**.
+4. Choose what to record: **Fullscreen apps and games only** (default; records only while a fullscreen app is running, including when you tab out of it) or **Whole screen**.
 5. Set the save hotkey, clip length (15 s to 2 min), frame rate (120/60/30) and quality (4K down to 480p) in the same window.
 6. Tick **Always on** to have Papyrus start with Windows with the buffer already on.
 7. Closing the window keeps Papyrus in the tray near the clock. Right-click the icon and choose **Exit Papyrus** to quit.
