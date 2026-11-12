@@ -51,6 +51,10 @@ sh build.sh
 
 This produces `dist/papyrus-engine.exe`. The setup wizard is built with Inno Setup 6 from `installer/papyrus.iss`; see `.github/workflows/release.yml`.
 
+## Licence
+
+Papyrus is released under the [MIT License](LICENSE). Copyright (c) 2026 Opifex Studios.
+
 ## Third-party
 
 `third_party/nv-codec-headers/nvEncodeAPI.h` comes from [FFmpeg/nv-codec-headers](https://github.com/FFmpeg/nv-codec-headers) under the MIT licence.
