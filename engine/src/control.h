@@ -22,7 +22,7 @@ static const wchar_t* const kPauseEvent = L"Local\\Papyrus.Worker.Pause";   // s
 static const wchar_t* const kWndClass  = L"PapyrusControl";
 static const wchar_t* const kMutex     = L"PapyrusControllerMutex";
 
-enum { IDC_TOGGLE = 101, IDC_ALWAYS, IDC_SAVE, IDC_OPEN, IDC_HOTKEY, IDC_LEN, IDC_FPS, IDC_QUAL, IDC_MODE, IDC_MIC, IDM_SHOW = 201, IDM_EXIT };
+enum { IDC_TOGGLE = 101, IDC_ALWAYS, IDC_SAVE, IDC_OPEN, IDC_HOTKEY, IDC_LEN, IDC_FPS, IDC_QUAL, IDC_MODE, IDC_MIC, IDM_SHOW = 201, IDM_EXIT, IDM_FOLDER };
 enum { WM_TRAY = WM_APP + 1, WM_SHOWME = WM_APP + 2, TIMER_WATCH = 1 };
 
 static HWND   g_wnd, g_toggle, g_always, g_save, g_open, g_status, g_hotkey, g_len, g_fps, g_qual, g_est, g_mode, g_micBox;
@@ -341,6 +341,16 @@ static void setAlwaysOn(bool on) {
     }
 }
 
+// Opens the Studio app (clip library and editor). Falls back to the clips folder if it is not installed.
+static void openStudio() {
+    wchar_t path[MAX_PATH];
+    wcscpy(path, g_exe);
+    if (wchar_t* slash = wcsrchr(path, L'\\')) *slash = 0;
+    wcscat(path, L"\\studio\\papyrus-studio.exe");
+    if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) ShellExecuteW(nullptr, L"open", path, nullptr, nullptr, SW_SHOWNORMAL);
+    else ShellExecuteW(nullptr, L"open", g_out, nullptr, nullptr, SW_SHOWNORMAL);
+}
+
 static void showWindow() {
     ShowWindow(g_wnd, SW_SHOWNORMAL);
     SetForegroundWindow(g_wnd);
@@ -361,7 +371,8 @@ static void trayMenu() {
     AppendMenuW(m, MF_STRING | (g_alwaysOn ? MF_CHECKED : 0), IDC_ALWAYS, L"Always on (start with Windows)");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING | (workerOn() ? 0 : MF_GRAYED), IDC_SAVE, L"Save clip now");
-    AppendMenuW(m, MF_STRING, IDC_OPEN, L"Open clips folder");
+    AppendMenuW(m, MF_STRING, IDC_OPEN, L"Clips and editor");
+    AppendMenuW(m, MF_STRING, IDM_FOLDER, L"Open clips folder");
     AppendMenuW(m, MF_STRING, IDM_SHOW, L"Show Papyrus window");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, IDM_EXIT, L"Exit Papyrus");
@@ -411,7 +422,8 @@ static LRESULT CALLBACK wndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         case IDC_TOGGLE: arm(!g_armed); return 0;
         case IDC_ALWAYS: setAlwaysOn(!g_alwaysOn); updateUi(nullptr); return 0;
         case IDC_SAVE:   if (workerOn()) SetEvent(g_evSave); return 0;
-        case IDC_OPEN:   ShellExecuteW(nullptr, L"open", g_out, nullptr, nullptr, SW_SHOWNORMAL); return 0;
+        case IDC_OPEN:   openStudio(); return 0;
+        case IDM_FOLDER: ShellExecuteW(nullptr, L"open", g_out, nullptr, nullptr, SW_SHOWNORMAL); return 0;
         case IDM_SHOW:   showWindow(); return 0;
         case IDM_EXIT:   quit(); return 0;
         }
@@ -557,8 +569,8 @@ static int run(bool startHidden, const wchar_t* outDir, const wchar_t* dataDir, 
     g_always = mk(L"BUTTON", L"Always on: start Papyrus when Windows starts and turn the replay buffer on", BS_AUTOCHECKBOX | BS_MULTILINE | BS_TOP | WS_TABSTOP,
                   20, 446, 400, 40, IDC_ALWAYS, g_font);
     g_save = mk(L"BUTTON", L"Save clip now", BS_PUSHBUTTON | WS_TABSTOP, 20, 494, 194, 34, IDC_SAVE, g_font);
-    g_open = mk(L"BUTTON", L"Open clips folder", BS_PUSHBUTTON | WS_TABSTOP, 226, 494, 194, 34, IDC_OPEN, g_font);
-    mk(L"STATIC", L"Sound: the game, Spotify and Discord each get their own track; no other app is recorded. Changing clip length, frame rate, quality or the microphone while recording restarts the buffer. Closing this window keeps Papyrus in the tray near the clock; right-click its icon to exit.",
+    g_open = mk(L"BUTTON", L"Clips and editor", BS_PUSHBUTTON | WS_TABSTOP, 226, 494, 194, 34, IDC_OPEN, g_font);
+    mk(L"STATIC", L"Sound: the game, Spotify and Discord each get their own track. Changing a setting while recording restarts the buffer. Closing this window keeps Papyrus in the tray; right-click its icon to exit.",
        0, 20, 538, 400, 86, 0, g_font);
 
     g_nid.cbSize = sizeof g_nid;

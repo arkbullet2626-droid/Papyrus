@@ -24,6 +24,10 @@ The installer is not code-signed yet, so Windows SmartScreen shows "Windows prot
 
 Clips are in `Videos\Papyrus`.
 
+## Papyrus Studio
+
+Click **Clips and editor** to open Studio. It lists your clips, plays them, shows each sound track on its own row, and lets you shorten the clip, drop or shorten individual sound tracks, change a track's volume, and save the result as a new clip. The picture is never re-encoded.
+
 The video is HEVC (H.265). VLC plays it directly; Windows' own players need the "HEVC Video Extensions" add-on from the Microsoft Store.
 
 ## Requirements
@@ -50,7 +54,7 @@ Needs Python with `pip install ziglang`.
 sh build.sh
 ```
 
-This produces `dist/papyrus-engine.exe`. The setup wizard is built with Inno Setup 6 from `installer/papyrus.iss`; see `.github/workflows/release.yml`.
+This produces `dist/papyrus-engine.exe`. Studio is a WinUI 3 app in `studio/` (`dotnet publish`, .NET 8). The setup wizard is built with Inno Setup 6 from `installer/papyrus.iss`; see `.github/workflows/release.yml`.
 
 ## Licence
 

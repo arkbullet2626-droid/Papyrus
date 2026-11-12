@@ -1,0 +1,97 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Window
+    x:Class="PapyrusStudio.MainWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    Title="Papyrus Studio">
+
+    <Window.SystemBackdrop>
+        <MicaBackdrop />
+    </Window.SystemBackdrop>
+
+    <Grid x:Name="RootGrid" Padding="16" ColumnSpacing="16">
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="320" />
+            <ColumnDefinition Width="*" />
+        </Grid.ColumnDefinitions>
+
+        <!-- Clip list -->
+        <Grid RowSpacing="8">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="*" />
+                <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
+            <Grid>
+                <TextBlock Text="Your clips" Style="{StaticResource SubtitleTextBlockStyle}" VerticalAlignment="Center" />
+                <Button x:Name="RefreshButton" Content="Refresh" HorizontalAlignment="Right" Click="Refresh_Click" />
+            </Grid>
+            <ListView x:Name="ClipList" Grid.Row="1" SelectionMode="Single" SelectionChanged="ClipList_SelectionChanged" />
+            <Button x:Name="OpenFolderButton" Grid.Row="2" Content="Open clips folder" HorizontalAlignment="Stretch" Click="OpenFolder_Click" />
+        </Grid>
+
+        <!-- Viewer and editor -->
+        <ScrollViewer Grid.Column="1" VerticalScrollBarVisibility="Auto">
+            <StackPanel Spacing="12">
+                <InfoBar x:Name="Status" IsOpen="False" IsClosable="True" />
+
+                <Border CornerRadius="8" Background="Black">
+                    <MediaPlayerElement x:Name="Player" Height="430" AreTransportControlsEnabled="True" AutoPlay="False" />
+                </Border>
+
+                <TextBlock x:Name="ClipTitle" Text="Pick a clip on the left." Style="{StaticResource BodyStrongTextBlockStyle}" TextWrapping="Wrap" />
+
+                <!-- Clip length -->
+                <Border Style="{StaticResource CardBorderStyle}">
+                    <StackPanel Spacing="8">
+                        <TextBlock Text="Clip length" Style="{StaticResource BodyStrongTextBlockStyle}" />
+                        <Grid ColumnSpacing="12">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="60" />
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="70" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
+                            </Grid.RowDefinitions>
+                            <TextBlock Text="Start" VerticalAlignment="Center" />
+                            <Slider x:Name="StartSlider" Grid.Column="1" Minimum="0" Maximum="1" StepFrequency="1" ValueChanged="Trim_ValueChanged" IsEnabled="False" />
+                            <TextBlock x:Name="StartLabel" Grid.Column="2" Text="0:00.0" VerticalAlignment="Center" />
+                            <Button x:Name="StartHereButton" Grid.Column="3" Content="Start at current position" Click="StartHere_Click" IsEnabled="False" />
+
+                            <TextBlock Grid.Row="1" Text="End" VerticalAlignment="Center" />
+                            <Slider x:Name="EndSlider" Grid.Row="1" Grid.Column="1" Minimum="0" Maximum="1" StepFrequency="0.1" ValueChanged="Trim_ValueChanged" IsEnabled="False" />
+                            <TextBlock x:Name="EndLabel" Grid.Row="1" Grid.Column="2" Text="0:00.0" VerticalAlignment="Center" />
+                            <Button x:Name="EndHereButton" Grid.Row="1" Grid.Column="3" Content="End at current position" Click="EndHere_Click" IsEnabled="False" />
+                        </Grid>
+                        <StackPanel Orientation="Horizontal" Spacing="12">
+                            <Button x:Name="PlaySelectionButton" Content="Play the selected part" Click="PlaySelection_Click" IsEnabled="False" />
+                            <TextBlock x:Name="LengthLabel" Text="" VerticalAlignment="Center" />
+                        </StackPanel>
+                        <TextBlock Style="{StaticResource CaptionStyle}"
+                                   Text="The start moves in 1-second steps so the picture can be copied without losing any quality. The end can be anywhere." />
+                    </StackPanel>
+                </Border>
+
+                <!-- Sound tracks -->
+                <Border Style="{StaticResource CardBorderStyle}">
+                    <StackPanel Spacing="8">
+                        <TextBlock Text="Sound tracks" Style="{StaticResource BodyStrongTextBlockStyle}" />
+                        <TextBlock x:Name="NoTracksLabel" Text="This clip has no sound." Style="{StaticResource CaptionStyle}" />
+                        <StackPanel x:Name="TracksPanel" Spacing="10" />
+                        <TextBlock Style="{StaticResource CaptionStyle}"
+                                   Text="Listen picks which track you hear while previewing. Untick Keep to leave a track out of the saved clip. Start and end are in seconds from the beginning of the original clip. Changing the volume re-encodes that track only." />
+                    </StackPanel>
+                </Border>
+
+                <StackPanel Orientation="Horizontal" Spacing="12">
+                    <Button x:Name="SaveButton" Content="Save as a new clip" Style="{StaticResource AccentButtonStyle}" Click="Save_Click" IsEnabled="False" />
+                    <Button x:Name="DeleteButton" Content="Delete this clip" Click="Delete_Click" IsEnabled="False" />
+                    <ProgressRing x:Name="Busy" IsActive="False" Width="24" Height="24" />
+                </StackPanel>
+            </StackPanel>
+        </ScrollViewer>
+    </Grid>
+</Window>

@@ -75,6 +75,7 @@ struct Mp4Mux {
         char      name[32] = "";       // shown by players as the track name
         uint32_t  emptyMs = 0;         // audio: silence before the first sample (lines the track up with the video)
         uint32_t  skipSamples = 0;     // audio: samples to skip at the start
+        uint64_t  playSamples = 0;     // audio: samples to play after the skip (0 = everything that is left)
     };
 
     uint32_t width = 0, height = 0, fps = 0;
@@ -101,7 +102,7 @@ struct Mp4Mux {
         return ok && moov;
     }
     void reset() {
-        for (int t = 0; t < MAX_TRACKS; t++) { tr[t].n = 0; tr[t].nSync = 0; tr[t].emptyMs = 0; tr[t].skipSamples = 0; }
+        for (int t = 0; t < MAX_TRACKS; t++) { tr[t].n = 0; tr[t].nSync = 0; tr[t].emptyMs = 0; tr[t].skipSamples = 0; tr[t].playSamples = 0; }
         dataBytes = 0; overflow = 0;
     }
     void setName(int track, const char* name) { strncpy(tr[track].name, name, sizeof tr[track].name - 1); }
@@ -138,7 +139,9 @@ struct Mp4Mux {
         const Track& k = tr[t];
         if (t == 0) return (uint32_t)(k.n * 1000 / fps);
         const uint64_t samples = k.n * AUDIO_FRAME;
-        return (uint32_t)((samples > k.skipSamples ? samples - k.skipSamples : 0) * 1000 / AUDIO_RATE) + k.emptyMs;
+        uint64_t play = samples > k.skipSamples ? samples - k.skipSamples : 0;
+        if (k.playSamples && k.playSamples < play) play = k.playSamples;
+        return (uint32_t)(play * 1000 / AUDIO_RATE) + k.emptyMs;
     }
 
     // Builds the index into the internal buffer. dataStart = absolute file offset of the first sample byte.
@@ -176,7 +179,7 @@ struct Mp4Mux {
                 w.u32(audio ? 0 : width << 16); w.u32(audio ? 0 : height << 16);
                 w.end(b);
             }
-            if (audio && (k.emptyMs || k.skipSamples)) {
+            if (audio && (k.emptyMs || k.skipSamples || k.playSamples)) {
                 size_t edts = w.begin("edts");
                 size_t elst = w.begin("elst");
                 w.u32(0); w.u32(k.emptyMs ? 2 : 1);

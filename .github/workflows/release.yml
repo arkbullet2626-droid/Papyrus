@@ -1,11 +1,11 @@
-# Builds the engine and the setup wizard, then publishes them as a GitHub release.
-# Runs whenever the VERSION file changes on main (or by hand from the Actions tab).
+# Builds the engine, the Studio app and the setup wizard.
+#   - push to main: also publishes a GitHub release for the version in VERSION, if that release does not exist yet
+#   - push to a dev/ branch or a manual run: build only; the installer is attached to the run as an artifact
 name: Release
 
 on:
   push:
-    branches: [main]
-    paths: [VERSION]
+    branches: [main, 'dev/**']
   workflow_dispatch:
 
 permissions:
@@ -14,8 +14,15 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+    env:
+      DOTNET_NOLOGO: true
+      DOTNET_CLI_TELEMETRY_OPTOUT: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '8.0.x'
 
       - name: Read version
         id: ver
@@ -30,6 +37,14 @@ jobs:
           python -m pip install --quiet ziglang
           sh build.sh
 
+      - name: Publish Studio app
+        shell: pwsh
+        run: >
+          dotnet publish studio/PapyrusStudio.csproj
+          -c Release -r win-x64 -p:Platform=x64 --self-contained true
+          -p:Version=${{ steps.ver.outputs.version }}
+          -o dist/studio
+
       - name: Build setup wizard
         shell: pwsh
         run: |
@@ -37,18 +52,24 @@ jobs:
           if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
           & $iscc "/DAppVersion=${{ steps.ver.outputs.version }}" installer\papyrus.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          Get-ChildItem dist
+          Get-ChildItem dist\*.exe
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: Papyrus-Setup-${{ steps.ver.outputs.version }}
+          path: dist/Papyrus-Setup-*.exe
 
       - name: Publish release
+        if: github.ref == 'refs/heads/main'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           V: ${{ steps.ver.outputs.version }}
         run: |
+          if gh release view "v$V" >/dev/null 2>&1; then
+            echo "Release v$V already exists - nothing to publish."
+            exit 0
+          fi
           notes="docs/releases/v$V.md"
           [ -f "$notes" ] || { mkdir -p docs/releases; echo "Papyrus $V" > "$notes"; }
-          if gh release view "v$V" >/dev/null 2>&1; then
-            gh release upload "v$V" "dist/Papyrus-Setup-$V.exe" --clobber
-          else
-            gh release create "v$V" "dist/Papyrus-Setup-$V.exe" --title "Papyrus $V" --notes-file "$notes" --target "$GITHUB_SHA"
-          fi
+          gh release create "v$V" "dist/Papyrus-Setup-$V.exe" --title "Papyrus $V" --notes-file "$notes" --target "$GITHUB_SHA"
