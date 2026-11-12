@@ -4,7 +4,7 @@ An ultra-light instant-replay game clipper for Windows by Opifex Studios.
 
 Papyrus keeps the last 30 seconds of your screen in memory as compressed video. Press **Ctrl+Shift+F9** and those 30 seconds are saved as an `.mp4`.
 
-**Status: early development (Milestone 2 of 7).** NVIDIA cards only, video only, no settings window yet.
+**Status: early development.** NVIDIA cards only, video only.
 
 ## Download
 
@@ -14,10 +14,13 @@ The installer is not code-signed yet, so Windows SmartScreen shows "Windows prot
 
 ## Using it
 
-1. Start **Papyrus** from the Start menu and leave the black window open.
-2. Play. Press **Ctrl+Shift+F9** to save the last 30 seconds. High beep = saved, low beep = failed.
-3. Clips are in `Videos\Papyrus` (Start menu: **Papyrus clips folder**).
-4. Press Ctrl+C in the black window to stop.
+1. Open **Papyrus** from the Start menu. The replay buffer starts **off**.
+2. Click the big button to turn the replay buffer on. Click it again to turn it off.
+3. While it is on, press **Ctrl+Shift+F9** (or click **Save clip now**) to save the last 30 seconds. High beep = saved, low beep = failed.
+4. Tick **Always on** to have Papyrus start with Windows with the buffer already on.
+5. Closing the window keeps Papyrus in the tray near the clock. Right-click the icon and choose **Exit Papyrus** to quit.
+
+Clips are in `Videos\Papyrus`.
 
 The video is HEVC (H.265). VLC plays it directly; Windows' own players need the "HEVC Video Extensions" add-on from the Microsoft Store.
 

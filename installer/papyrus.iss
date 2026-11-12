@@ -27,6 +27,7 @@ OutputBaseFilename=Papyrus-Setup-{#AppVersion}
 UninstallDisplayName=Papyrus
 UninstallDisplayIcon={app}\papyrus-engine.exe
 CloseApplications=yes
+AppMutex=PapyrusControllerMutex
 InfoBeforeFile=welcome.txt
 
 [Languages]
@@ -41,12 +42,16 @@ Source: "..\README.md"; DestDir: "{app}"; DestName: "README.txt"; Flags: ignorev
 Source: "..\third_party\nv-codec-headers\LICENSE.txt"; DestDir: "{app}"; DestName: "THIRD-PARTY-LICENSES.txt"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\Papyrus"; Filename: "{app}\papyrus-engine.exe"; Parameters: "--replay --pause"; WorkingDir: "{app}"; Comment: "Start the replay buffer. Ctrl+Shift+F9 saves the last 30 seconds."
+Name: "{group}\Papyrus"; Filename: "{app}\papyrus-engine.exe"; WorkingDir: "{app}"; Comment: "Open Papyrus and switch the replay buffer on or off."
 Name: "{group}\Papyrus clips folder"; Filename: "{app}\papyrus-engine.exe"; Parameters: "--open-clips"; WorkingDir: "{app}"
 Name: "{group}\Papyrus self-test"; Filename: "{app}\papyrus-engine.exe"; Parameters: "--replay --seconds 45 --autosave 40 --pause"; WorkingDir: "{app}"; Comment: "Runs for 45 seconds and saves one clip by itself."
 Name: "{group}\Papyrus 4K benchmark"; Filename: "{app}\papyrus-engine.exe"; Parameters: "--bench4k --pause"; WorkingDir: "{app}"
 Name: "{group}\Uninstall Papyrus"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\Papyrus"; Filename: "{app}\papyrus-engine.exe"; Parameters: "--replay --pause"; WorkingDir: "{app}"; Tasks: desktopicon
+Name: "{autodesktop}\Papyrus"; Filename: "{app}\papyrus-engine.exe"; WorkingDir: "{app}"; Tasks: desktopicon
+
+[Registry]
+; "Always on" adds this value from inside Papyrus; make sure uninstalling removes it.
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; ValueName: "Papyrus"; Flags: dontcreatekey uninsdeletevalue
 
 [Run]
-Filename: "{app}\papyrus-engine.exe"; Parameters: "--replay --pause"; Description: "Start Papyrus now"; Flags: postinstall nowait skipifsilent
+Filename: "{app}\papyrus-engine.exe"; Description: "Open Papyrus now"; Flags: postinstall nowait skipifsilent

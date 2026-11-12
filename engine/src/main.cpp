@@ -33,6 +33,7 @@
 #include "wgc_abi.h"
 #include "mp4.h"
 #include "ring.h"
+#include "control.h"
 #include "../../third_party/nv-codec-headers/nvEncodeAPI.h"
 
 #ifndef PAPYRUS_VER
@@ -60,6 +61,16 @@ static void logf(const char* fmt, ...) {
 }
 
 static bool g_pauseAtExit = false;
+static wchar_t g_errPath[MAX_PATH] = L"";    // worker mode: where a fatal error is left for the control window
+static wchar_t g_statPath[MAX_PATH] = L"";
+static void writeSmallFile(const wchar_t* path, const char* text) {
+    if (!path[0]) return;
+    HANDLE f = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    DWORD wr = 0;
+    WriteFile(f, text, (DWORD)strlen(text), &wr, nullptr);
+    CloseHandle(f);
+}
 static void pauseIfAsked() {
     if (!g_pauseAtExit) return;
     printf("\nPress any key to close this window . . . ");
@@ -74,6 +85,7 @@ static void pauseIfAsked() {
     vsnprintf(buf, sizeof buf, fmt, ap);
     va_end(ap);
     logf("\nERROR: %s\n", buf);
+    writeSmallFile(g_errPath, buf);
     logf("Papyrus stopped. Please send the whole text above (or the .log file) back so it can be fixed.\n");
     if (g_log) fclose(g_log);
     pauseIfAsked();
@@ -118,6 +130,10 @@ struct Settings {
     bool     pause       = false;   // wait for a key before the window closes (used by the Start menu shortcuts)
     bool     openClips   = false;   // just open the clips folder in Explorer
     wchar_t  outDir[MAX_PATH] = L"";
+    bool     record      = false;   // record straight to a file
+    bool     child       = false;   // hidden worker started by the control window
+    bool     tray        = false;   // control window: start hidden in the tray
+    DWORD    parentPid   = 0;
     wchar_t  out[MAX_PATH] = L"";
 };
 static Settings g_cfg;
@@ -1180,7 +1196,9 @@ static void usage() {
            "papyrus-engine.exe [options]\n"
            " Modes\n"
            "  --replay       instant replay: keep the last seconds in RAM, save an .mp4 when the hotkey is pressed\n"
-           "  (no mode)      record straight to an .mp4 for --seconds\n"
+           "  (no mode)      open the Papyrus control window (tray icon and switches)\n"
+           "  --tray         same, but start hidden in the tray\n"
+           "  --record       record straight to an .mp4 for --seconds\n"
            "  --bench4k      synthetic 3840x2160 encoder benchmark at presets P3, P4, P5 (no capture, no file)\n"
            "  --list         list monitors and exit\n"
            " Replay options\n"
@@ -1211,6 +1229,20 @@ int wmain(int argc, wchar_t** argv) {
     LARGE_INTEGER f; QueryPerformanceFrequency(&f); g_qpf = f.QuadPart;
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
+    // Papyrus is a windowed program. Modes that print results (benchmark, self-test, record) get a console here;
+    // the control window and the hidden worker never open one.
+    bool wantConsole = false, isChild = false;
+    for (int i = 1; i < argc; i++) {
+        if (!wcscmp(argv[i], L"--child")) isChild = true;
+        else if (wcscmp(argv[i], L"--tray") && wcscmp(argv[i], L"--open-clips")) wantConsole = true;
+    }
+    if (wantConsole && !isChild && (AttachConsole(ATTACH_PARENT_PROCESS) || AllocConsole())) {
+        freopen("CONOUT$", "w", stdout);
+        freopen("CONOUT$", "w", stderr);
+        freopen("CONIN$", "r", stdin);
+        SetConsoleTitleW(L"Papyrus");
+    }
+
     for (int i = 1; i < argc; i++) {
         auto is = [&](const wchar_t* s) { return wcscmp(argv[i], s) == 0; };
         auto num = [&](int lo, int hi) {
@@ -1224,6 +1256,10 @@ int wmain(int argc, wchar_t** argv) {
         else if (is(L"--bitrate")) { g_cfg.bitrateMbps = num(1, 400); g_cfg.bitrateSet = true; if (g_cfg.maxrateMbps < g_cfg.bitrateMbps * 3 / 2) g_cfg.maxrateMbps = g_cfg.bitrateMbps * 3 / 2; }
         else if (is(L"--maxrate")) g_cfg.maxrateMbps = num(1, 600);
         else if (is(L"--replay")) g_cfg.replay = true;
+        else if (is(L"--record")) g_cfg.record = true;
+        else if (is(L"--child")) g_cfg.child = true;
+        else if (is(L"--tray")) g_cfg.tray = true;
+        else if (is(L"--parent")) g_cfg.parentPid = (DWORD)num(1, 0x7fffffff);
         else if (is(L"--clip")) { g_cfg.clip = num(5, 300); }
         else if (is(L"--autosave")) g_cfg.autosave = num(1, 24 * 3600);
         else if (is(L"--hotkey") && i + 1 < argc) {
@@ -1249,13 +1285,14 @@ int wmain(int argc, wchar_t** argv) {
     g_pauseAtExit = g_cfg.pause;
 
     // Clips and recordings go to Videos\Papyrus, logs to %LOCALAPPDATA%\Papyrus\logs (both writable without admin rights)
-    wchar_t outDir[MAX_PATH] = L"", logDir[MAX_PATH] = L"";
+    wchar_t outDir[MAX_PATH] = L"", logDir[MAX_PATH] = L"", dataDir[MAX_PATH] = L"";
     PWSTR known = nullptr;
     if (g_cfg.outDir[0]) wcscpy(outDir, g_cfg.outDir);
     else if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Videos, KF_FLAG_CREATE, nullptr, &known))) swprintf(outDir, MAX_PATH, L"%ls\\Papyrus", known);
     if (known) { CoTaskMemFree(known); known = nullptr; }
     if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, KF_FLAG_CREATE, nullptr, &known))) {
         swprintf(logDir, MAX_PATH, L"%ls\\Papyrus", known);
+        wcscpy(dataDir, logDir);
         CreateDirectoryW(logDir, nullptr);
         wcscat(logDir, L"\\logs");
     }
@@ -1270,6 +1307,19 @@ int wmain(int argc, wchar_t** argv) {
     CreateDirectoryW(outDir, nullptr);
     CreateDirectoryW(logDir, nullptr);
     wcscpy(g_outDir, outDir);
+    if (!dataDir[0]) wcscpy(dataDir, logDir);
+
+    // No mode given: this is the control window (tray icon + switches). It starts the worker on demand.
+    if (!g_cfg.replay && !g_cfg.record && !g_cfg.bench && !g_cfg.list && !g_cfg.openClips) {
+        wchar_t ver[64];
+        swprintf(ver, 64, L"version %hs", PAPYRUS_VER);
+        return ctl::run(g_cfg.tray, outDir, dataDir, ver, g_cfg.hkText);
+    }
+    if (g_cfg.child) {
+        swprintf(g_errPath, MAX_PATH, L"%ls\\last-error.txt", dataDir);
+        swprintf(g_statPath, MAX_PATH, L"%ls\\status.txt", dataDir);
+        g_pauseAtExit = false;
+    }
     if (g_cfg.openClips) {
         ShellExecuteW(nullptr, L"open", outDir, nullptr, nullptr, SW_SHOWNORMAL);
         return 0;
@@ -1371,6 +1421,14 @@ int wmain(int argc, wchar_t** argv) {
     bool hotkeyOk = false;
     if (g_cfg.replay) {
         hotkeyOk = RegisterHotKey(nullptr, 1, g_cfg.hkMods | MOD_NOREPEAT, g_cfg.hkVk) != 0;
+        if (g_cfg.child) {
+            char st[400];
+            if (hotkeyOk) snprintf(st, sizeof st, "Recording %ux%u at %d fps. Press %ls to save the last %d seconds (high beep = saved).",
+                                   g_encW, g_encH, g_cfg.fps, g_cfg.hkText, g_cfg.clip);
+            else snprintf(st, sizeof st, "Recording %ux%u at %d fps, but another program already uses %ls. Use the \"Save clip now\" button instead.",
+                          g_encW, g_encH, g_cfg.fps, g_cfg.hkText);
+            writeSmallFile(g_statPath, st);
+        }
         if (!hotkeyOk)
             logf("\n  WARNING: Windows would not give Papyrus the hotkey %ls - another program already owns it.\n"
                  "           Close that program, or start Papyrus with a different hotkey (see script 1b).\n", g_cfg.hkText);
@@ -1405,6 +1463,13 @@ int wmain(int argc, wchar_t** argv) {
     bool ramExact = true;
     const int interval = g_cfg.replay ? 10 : 1;          // seconds between table rows
     bool autosaved = false;
+    // Worker mode: the control window asks us to stop or save through named events, and we stop if it disappears.
+    HANDLE hCtlStop = nullptr, hCtlSave = nullptr, hParent = nullptr;
+    if (g_cfg.child) {
+        hCtlStop = OpenEventW(SYNCHRONIZE, FALSE, ctl::kStopEvent);
+        hCtlSave = OpenEventW(SYNCHRONIZE, FALSE, ctl::kSaveEvent);
+        if (g_cfg.parentPid) hParent = OpenProcess(SYNCHRONIZE, FALSE, g_cfg.parentPid);
+    }
     // Waits `ms`, handling the save hotkey meanwhile. Returns true when the capture thread has finished.
     auto pump = [&](DWORD ms) {
         const int64_t deadline = qpc() + (int64_t)ms * g_qpf / 1000;
@@ -1414,9 +1479,18 @@ int wmain(int argc, wchar_t** argv) {
             if (rem <= 0) return false;
             DWORD wait = (DWORD)(rem * 1000 / g_qpf) + 1;
             if (wait > 250) wait = 250;
-            const DWORD r = MsgWaitForMultipleObjects(1, &hCapture, FALSE, wait, QS_ALLINPUT);
+            HANDLE hs[4];
+            DWORD n = 0;
+            hs[n++] = hCapture;
+            const DWORD iStop = hCtlStop ? n : 99;   if (hCtlStop) hs[n++] = hCtlStop;
+            const DWORD iSave = hCtlSave ? n : 99;   if (hCtlSave) hs[n++] = hCtlSave;
+            const DWORD iParent = hParent ? n : 99;  if (hParent) hs[n++] = hParent;
+            const DWORD r = MsgWaitForMultipleObjects(n, hs, FALSE, wait, QS_ALLINPUT);
             if (r == WAIT_OBJECT_0) return true;
-            if (r == WAIT_OBJECT_0 + 1) {
+            if (r == WAIT_OBJECT_0 + iStop) { g_stop.store(true); hCtlStop = nullptr; }
+            else if (r == WAIT_OBJECT_0 + iParent) { g_stop.store(true); hParent = nullptr; }
+            else if (r == WAIT_OBJECT_0 + iSave) { if (g_evSave) SetEvent(g_evSave); }
+            else if (r == WAIT_OBJECT_0 + n) {
                 MSG m;
                 while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE))
                     if (m.message == WM_HOTKEY && g_evSave) SetEvent(g_evSave);
