@@ -198,6 +198,19 @@ public static class Engine
         ReloadSettings();
     }
 
+    /// <summary>Small on/off choices the app itself remembers (same settings.ini, ignored by the recorder).</summary>
+    public static bool GetFlag(string key, bool fallback)
+    {
+        try { Directory.CreateDirectory(DataDir); return GetPrivateProfileIntW("app", key, fallback ? 1 : 0, IniPath) != 0; }
+        catch { return fallback; }
+    }
+
+    public static void SetFlag(string key, bool value)
+    {
+        try { Directory.CreateDirectory(DataDir); WritePrivateProfileStringW("app", key, value ? "1" : "0", IniPath); }
+        catch { }
+    }
+
     public static string HotkeyName(int vk, int mods)
     {
         string text = "";

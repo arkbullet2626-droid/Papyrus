@@ -534,8 +534,44 @@ static bool decodeTrack(const std::vector<std::vector<uint8_t>>& in, std::vector
     return ok;
 }
 
-static std::vector<std::vector<uint8_t>>* g_regainOut = nullptr;
-static void regainCollect(int, const uint8_t* data, uint32_t size, int64_t) { g_regainOut->emplace_back(data, data + size); }
+static std::vector<std::vector<uint8_t>>* g_collectOut = nullptr;
+static void collectPacket(int, const uint8_t* data, uint32_t size, int64_t) { g_collectOut->emplace_back(data, data + size); }
+
+// Encodes 16-bit stereo PCM to raw AAC frames. Media Foundation must already be started.
+// *delay = samples the encoder adds in front (one frame).
+static bool encodeAac(const std::vector<int16_t>& pcm, std::vector<std::vector<uint8_t>>& out, uint32_t* delay) {
+    bool ok = false;
+    Track enc;
+    const PacketFn savedFn = g_cfg.onPacket;
+    g_cfg.onPacket = collectPacket;
+    g_collectOut = &out;
+    if (createEncoder(enc)) {
+        const uint32_t frames = (uint32_t)(pcm.size() / CH);
+        feed(enc, 0, pcm.data(), frames, 0);
+        if (enc.fill) feed(enc, 0, nullptr, FRAME - enc.fill, 0);                // pad the last block with silence
+        feed(enc, 0, nullptr, FRAME, 0);                                         // one more block pushes the tail out
+        enc.enc->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
+        drainEncoder(enc, 0);
+        ok = !out.empty();
+        *delay = FRAME;
+    }
+    closeTrack(enc);
+    g_cfg.onPacket = savedFn;
+    g_collectOut = nullptr;
+    return ok;
+}
+
+// For the editor's track mixing: encode a whole PCM stream.
+static bool encodeTrack(const std::vector<int16_t>& pcm, std::vector<std::vector<uint8_t>>& out, uint32_t* delay) {
+    const bool com = SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED));
+    bool ok = false;
+    if (SUCCEEDED(MFStartup(MF_VERSION, MFSTARTUP_LITE))) {
+        ok = encodeAac(pcm, out, delay);
+        MFShutdown();
+    }
+    if (com) CoUninitialize();
+    return ok;
+}
 
 static bool regain(const std::vector<std::vector<uint8_t>>& in, int gainPercent, std::vector<std::vector<uint8_t>>& out, uint32_t* extraDelay) {
     const bool com = SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED));
@@ -551,23 +587,9 @@ static bool regain(const std::vector<std::vector<uint8_t>>& in, int gainPercent,
             long x = (long)v * gainPercent / 100;
             v = (int16_t)(x > 32767 ? 32767 : x < -32768 ? -32768 : x);
         }
-        Track enc;
-        const PacketFn savedFn = g_cfg.onPacket;
-        g_cfg.onPacket = regainCollect;
-        g_regainOut = &out;
-        if (createEncoder(enc)) {
-            const uint32_t frames = (uint32_t)(pcm.size() / CH);
-            feed(enc, 0, pcm.data(), frames, 0);
-            if (enc.fill) feed(enc, 0, nullptr, FRAME - enc.fill, 0);                // pad the last block with silence
-            feed(enc, 0, nullptr, FRAME, 0);                                         // one more block pushes the tail out
-            enc.enc->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
-            drainEncoder(enc, 0);
-            ok = !out.empty();
-            *extraDelay = missingFrames < FRAME ? (uint32_t)(FRAME - missingFrames) : 0;   // the encoder adds one frame of delay
-        }
-        closeTrack(enc);
-        g_cfg.onPacket = savedFn;
-        g_regainOut = nullptr;
+        uint32_t delay = 0;
+        ok = encodeAac(pcm, out, &delay);
+        *extraDelay = missingFrames < delay ? (uint32_t)(delay - missingFrames) : 0;
     }
     MFShutdown();
     if (com) CoUninitialize();

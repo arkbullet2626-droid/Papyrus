@@ -142,6 +142,7 @@ struct Settings {
     wchar_t  editIn[MAX_PATH] = L"";   // --edit FILE: trim a clip into --out
     wchar_t  peaksIn[MAX_PATH] = L"";  // --peaks FILE: write each sound track's loudness outline into --out
     long long editStart  = 0, editEnd = -1;
+    bool     editMix     = false;      // --mix: blend the kept sound tracks into one
     edit::TrackEdit edits[4];
     DWORD    gamePid     = 0;       // worker: process whose sound becomes the "Game" track
     bool     mic         = false;   // also record the default microphone as its own track
@@ -1393,6 +1394,7 @@ int wmain(int argc, wchar_t** argv) {
         else if (is(L"--info") && i + 1 < argc) wcsncpy(g_cfg.infoIn, argv[++i], MAX_PATH - 1);
         else if (is(L"--edit") && i + 1 < argc) wcsncpy(g_cfg.editIn, argv[++i], MAX_PATH - 1);
         else if (is(L"--peaks") && i + 1 < argc) wcsncpy(g_cfg.peaksIn, argv[++i], MAX_PATH - 1);
+        else if (is(L"--mix")) g_cfg.editMix = true;
         else if (is(L"--start") && i + 1 < argc) g_cfg.editStart = _wtoi64(argv[++i]);
         else if (is(L"--end") && i + 1 < argc) g_cfg.editEnd = _wtoi64(argv[++i]);
         else if (is(L"--atrack") && i + 1 < argc) {                       // N:keep:startMs:endMs:volumePercent
@@ -1466,7 +1468,12 @@ int wmain(int argc, wchar_t** argv) {
             aud::g_cfg.qpcFreq = g_qpf;
             int64_t actual = 0;
             wcscpy(g_errPath, errPath);                  // if the graphics card cannot make the black frames, say why
-            ok = edit::trim(g_cfg.editIn, g_cfg.out, g_cfg.editStart, g_cfg.editEnd, g_cfg.edits, 4, aud::regain, makeBlackFrames, &actual, err);
+            edit::Tools tools;
+            tools.regain = aud::regain;
+            tools.decode = aud::decodeTrack;
+            tools.encode = aud::encodeTrack;
+            tools.black = makeBlackFrames;
+            ok = edit::trim(g_cfg.editIn, g_cfg.out, g_cfg.editStart, g_cfg.editEnd, g_cfg.edits, 4, g_cfg.editMix, tools, &actual, err);
             if (!ok) DeleteFileW(g_cfg.out);
         }
         if (!ok) writeSmallFile(errPath, err.c_str());

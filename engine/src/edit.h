@@ -302,6 +302,17 @@ static inline bool writePeaks(const PathChar* in, const PathChar* out, int bucke
     return true;
 }
 
+// Encodes 16-bit stereo 48 kHz PCM to raw AAC frames. *delay = samples of encoder delay in front (Windows only).
+typedef bool (*EncodeFn)(const std::vector<int16_t>& pcm, std::vector<std::vector<uint8_t>>& out, uint32_t* delay);
+
+// Optional extras for trim(). Any of them may be null; the edit that needs a missing one fails with a clear message.
+struct Tools {
+    RegainFn regain = nullptr;      // change one track's volume
+    DecodeFn decode = nullptr;      // \ together: mix several tracks into one
+    EncodeFn encode = nullptr;      // /
+    bool (*black)(uint32_t, uint32_t, uint32_t, int, std::vector<std::vector<uint8_t>>&, HevcParamSets&) = nullptr;   // black frames (see BlackFn)
+};
+
 // Makes `frames` black video frames of the given size (first one a keyframe) as length-prefixed HEVC samples
 // without parameter sets, and reports the parameter sets they need. Windows only (uses the graphics card's encoder).
 typedef bool (*BlackFn)(uint32_t width, uint32_t height, uint32_t fps, int frames, std::vector<std::vector<uint8_t>>& samples, HevcParamSets& ps);
@@ -323,8 +334,11 @@ static inline bool sameParamSets(const HevcParamSets& a, const HevcParamSets& b)
 
 // startMs/endMs: the part of the clip's picture to keep (endMs < 0 = to the end). edits[i] applies to the i-th sound track.
 // On success *actualStartMs is where the new clip's picture starts (the chosen frame).
+// mix = true: the kept sound tracks are blended into one track called "Mixed", so every player plays all of them.
 static inline bool trim(const PathChar* in, const PathChar* out, int64_t startMs, int64_t endMs, const TrackEdit* edits, int nEdits,
-                        RegainFn regain, BlackFn black, int64_t* actualStartMs, std::string& err) {
+                        bool mix, const Tools& tools, int64_t* actualStartMs, std::string& err) {
+    const RegainFn regain = tools.regain;
+    const BlackFn black = tools.black;
     Clip c;
     if (!load(in, c, err)) return false;
     const InTrack& v = c.tracks[0];
@@ -386,8 +400,9 @@ static inline bool trim(const PathChar* in, const PathChar* out, int64_t startMs
     const std::vector<uint8_t> origPrefix = (inband && !v.inband) ? paramSetPrefix(v.ps) : std::vector<uint8_t>();
     const std::vector<uint8_t> blackPrefix = (inband && haveBlack) ? paramSetPrefix(blackPs) : std::vector<uint8_t>();
 
-    struct OutAudio { int src; int64_t first, count; uint32_t emptyMs, skip; uint64_t play; std::vector<std::vector<uint8_t>> re; };
+    struct OutAudio { int src; int64_t first, count; uint32_t emptyMs, skip; uint64_t play; int gain; std::string name; std::vector<std::vector<uint8_t>> re; };
     std::vector<OutAudio> outs;
+    const bool mixing = mix && (wants.size() > 1 || (wants.size() == 1 && wants[0].e.gainPercent != 100));
     for (const Want& w : wants) {
         const InTrack& a = c.tracks[(size_t)w.src];
         const double trackStart = a.emptyMs / 1000.0;
@@ -399,11 +414,11 @@ static inline bool trim(const PathChar* in, const PathChar* out, int64_t startMs
         if (last >= (int64_t)a.sizes.size()) last = (int64_t)a.sizes.size() - 1;
         if (last < first) continue;
         OutAudio o;
-        o.src = w.src; o.first = first; o.count = last - first + 1;
+        o.src = w.src; o.first = first; o.count = last - first + 1; o.gain = w.e.gainPercent; o.name = a.name;
         o.skip = (uint32_t)(p0 - first * (int64_t)F);
         o.play = (uint64_t)(p1 - p0);
         o.emptyMs = (uint32_t)((w.t0 - movieStart) * 1000.0 + 0.5);
-        if (w.e.gainPercent != 100) {
+        if (!mixing && w.e.gainPercent != 100) {
             if (!regain) { err = "changing a track's volume is not available here"; return false; }
             std::vector<std::vector<uint8_t>> src((size_t)o.count);
             for (int64_t k = 0; k < o.count; k++) {
@@ -416,6 +431,44 @@ static inline bool trim(const PathChar* in, const PathChar* out, int64_t startMs
             o.skip += extra;
         }
         outs.push_back(std::move(o));
+    }
+
+    // Blend the kept tracks into one: decode each, add them up where they belong on the new clip's timeline, encode once.
+    if (mixing) {
+        if (!tools.decode || !tools.encode) { err = "mixing sound tracks is not available here"; return false; }
+        const size_t total = (size_t)((movieEnd - movieStart) * R + 0.5);
+        std::vector<int32_t> sum(total * 2, 0);
+        for (const OutAudio& o : outs) {
+            const InTrack& a = c.tracks[(size_t)o.src];
+            std::vector<std::vector<uint8_t>> src((size_t)o.count);
+            for (int64_t k = 0; k < o.count; k++) {
+                src[(size_t)k].resize(a.sizes[(size_t)(o.first + k)]);
+                if (PAPYRUS_FSEEK(c.f, (long long)a.offs[(size_t)(o.first + k)], SEEK_SET) ||
+                    fread(src[(size_t)k].data(), 1, src[(size_t)k].size(), c.f) != src[(size_t)k].size()) { err = "could not read the clip"; return false; }
+            }
+            std::vector<int16_t> pcm;
+            uint32_t missing = 0;
+            if (!tools.decode(src, pcm, &missing)) { err = "could not decode a sound track for mixing"; return false; }
+            const int64_t frames = (int64_t)(pcm.size() / 2);
+            const int64_t from = (int64_t)o.skip - (int64_t)missing;             // first wanted frame in the decoded stream
+            const int64_t at = (int64_t)(o.emptyMs / 1000.0 * R + 0.5);          // where it starts in the mix
+            for (int64_t j = 0; j < (int64_t)o.play; j++) {
+                const int64_t d = from + j, m = at + j;
+                if (d < 0 || d >= frames || m < 0 || m >= (int64_t)total) continue;
+                sum[(size_t)m * 2] += (int32_t)pcm[(size_t)d * 2] * o.gain / 100;
+                sum[(size_t)m * 2 + 1] += (int32_t)pcm[(size_t)d * 2 + 1] * o.gain / 100;
+            }
+        }
+        std::vector<int16_t> mixed(sum.size());
+        for (size_t i = 0; i < sum.size(); i++) mixed[i] = (int16_t)(sum[i] > 32767 ? 32767 : sum[i] < -32768 ? -32768 : sum[i]);
+        OutAudio one;
+        one.src = outs.empty() ? 1 : outs[0].src; one.first = 0; one.count = 0; one.emptyMs = 0; one.gain = 100; one.name = "Mixed";
+        uint32_t delay = 0;
+        if (!tools.encode(mixed, one.re, &delay) || one.re.empty()) { err = "could not encode the mixed sound track"; return false; }
+        one.skip = delay;
+        one.play = total;
+        outs.clear();
+        outs.push_back(std::move(one));
     }
 
     // The video, in order: black lead, hidden lead-in frames (keyframe up to the cut), the shown frames, black tail.
@@ -489,7 +542,7 @@ static inline bool trim(const PathChar* in, const PathChar* out, int64_t startMs
         rel += sz;
     }
     for (size_t a = 0; a < outs.size(); a++) {
-        m.setName((int)a + 1, c.tracks[(size_t)outs[a].src].name);
+        m.setName((int)a + 1, outs[a].name.c_str());
         m.tr[a + 1].emptyMs = outs[a].emptyMs;
         m.tr[a + 1].skipSamples = outs[a].skip;
         m.tr[a + 1].playSamples = outs[a].play;

@@ -45,6 +45,8 @@
                         <TextBlock Text="Sound tracks" Style="{StaticResource BodyStrongTextBlockStyle}" />
                         <TextBlock x:Name="NoTracksLabel" Text="This clip has no sound." Style="{StaticResource CaptionStyle}" />
                         <StackPanel x:Name="TracksPanel" Spacing="16" />
+                        <CheckBox x:Name="MixBox" Checked="MixBox_Changed" Unchecked="MixBox_Changed"
+                                  Content="When saving, mix the kept tracks into one track, so every player and Discord plays all of them" />
                         <TextBlock Style="{StaticResource CaptionStyle}"
                                    Text="Each strip shows how loud that track is over time. A track follows the clip until you move its bars; after that it plays exactly where its bars are, even before or after the picture, where the saved clip shows a black screen. Its bars snap to the clip's ends when close. Reset links every track to the clip again. Listen picks which track you hear while previewing; untick Keep to leave a track out. Changing the volume re-encodes that track only." />
                     </StackPanel>

@@ -24,6 +24,9 @@ public sealed partial class EditorPage : Page
         _videoBar.RangeChanged += ClipRangeChanged;
         _videoBar.SeekRequested += Seek;
         VideoBarHost.Children.Add(_videoBar);
+        _mixReady = false;
+        MixBox.IsChecked = Engine.GetFlag("mix_on_save", false);
+        _mixReady = true;
         _timer.Tick += Timer_Tick;
         Unloaded += (_, _) => { _timer.Stop(); _playingSelection = false; try { Player.MediaPlayer?.Pause(); } catch { } Player.Source = null; };
     }
@@ -57,6 +60,7 @@ public sealed partial class EditorPage : Page
     private bool _playingSelection;
     private bool _loading;
     private RangeBar _videoBar = null!;
+    private bool _mixReady;
     private static readonly Windows.UI.Color[] TrackColors =
     {
         Windows.UI.Color.FromArgb(255, 76, 175, 80), Windows.UI.Color.FromArgb(255, 30, 215, 96),
@@ -235,6 +239,11 @@ public sealed partial class EditorPage : Page
                                          Clock(_videoBar.Start), Clock(_videoBar.End), Clock(Math.Max(0, _videoBar.End - _videoBar.Start)));
     }
 
+    private void MixBox_Changed(object sender, RoutedEventArgs e)
+    {
+        if (_mixReady) Engine.SetFlag("mix_on_save", MixBox.IsChecked == true);
+    }
+
     private void Reset_Click(object sender, RoutedEventArgs e)
     {
         _videoBar.Reset(_duration);
@@ -289,6 +298,8 @@ public sealed partial class EditorPage : Page
             args.Add(string.Format(CultureInfo.InvariantCulture, "{0}:{1}:{2}:{3}:{4}", t.Number, t.Keep.IsChecked == true ? 1 : 0,
                                    (long)Math.Round(start * 1000), (long)Math.Round(end * 1000), (int)t.Volume.Value));
         }
+
+        if (MixBox.IsChecked == true) args.Add("--mix");
 
         SaveButton.IsEnabled = false;
         Busy.IsActive = true;
