@@ -137,7 +137,6 @@ public sealed partial class SettingsPage : Page
         if (key != VirtualKey.Escape)
         {
             int mods = (IsDown(VirtualKey.Control) ? Engine.ModControl : 0) | (IsDown(VirtualKey.Shift) ? Engine.ModShift : 0) | (IsDown(VirtualKey.Menu) ? Engine.ModAlt : 0);
-            if (mods == 0 || mods == Engine.ModShift) mods = Engine.ModControl | Engine.ModShift;     // a bare key would steal normal typing
             _settings.HotkeyVk = (int)key;
             _settings.HotkeyMods = mods;
             Engine.SaveSettings(_settings);

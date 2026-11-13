@@ -31,7 +31,7 @@
                     <StackPanel Spacing="4">
                         <TextBlock Text="Save hotkey" />
                         <Button x:Name="HotkeyButton" Width="340" HorizontalContentAlignment="Left" Click="HotkeyButton_Click" KeyDown="HotkeyButton_KeyDown" LostFocus="HotkeyButton_LostFocus" />
-                        <TextBlock Style="{StaticResource CaptionStyle}" Text="Click the box, then press the keys you want, for example Ctrl + Shift + F9. Press Esc to cancel." />
+                        <TextBlock Style="{StaticResource CaptionStyle}" Text="Click the box, then press the key or keys you want, for example F8 or Ctrl + Shift + F9. Exactly what you press is used. Press Esc to cancel." />
                     </StackPanel>
                     <ComboBox x:Name="LengthBox" Header="Clip length" Width="340" SelectionChanged="Setting_SelectionChanged">
                         <ComboBoxItem Content="15 seconds" Tag="15" />
