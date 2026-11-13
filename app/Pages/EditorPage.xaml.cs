@@ -334,9 +334,10 @@ public sealed partial class EditorPage : Page
         _clipPath = null;
         SetEditorEnabled(false);
         await Task.Delay(300);                              // let the player let go of the file
-        if (RecycleBin.Send(path)) App.Window?.ShowStatus("Moved to the Recycle Bin.", false);
+        bool deleted = RecycleBin.Send(path);
+        App.Window?.ShowClips();                            // going back clears any old message, so show the new one after
+        if (deleted) App.Window?.ShowStatus("Moved to the Recycle Bin.", false);
         else App.Window?.ShowStatus("The clip could not be deleted. Is it open in another program?", true);
-        App.Window?.ShowClips();
     }
 }
 

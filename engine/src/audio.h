@@ -167,8 +167,10 @@ static void drainEncoder(Track& t, int id) {
         DWORD len = 0;
         if (SUCCEEDED(t.outBuf->Lock(&p, nullptr, &len))) {
             if (len && t.tTail != t.tHead) {
-                // The decoder plays a packet's sound one frame later than the block that went in with it.
-                const int64_t when = t.times[t.tTail % 16] - kFrameTime;
+                // Measured on a real clip (mix test, 0.9.6): Windows' AAC encoder hands back packets that decode
+                // straight to the block that went in, with no extra frame of delay in front. So the packet's
+                // time is simply the time of its block.
+                const int64_t when = t.times[t.tTail % 16];
                 t.tTail++;
                 t.packets++;
                 g_cfg.onPacket(id, p, len, when);
@@ -538,7 +540,7 @@ static std::vector<std::vector<uint8_t>>* g_collectOut = nullptr;
 static void collectPacket(int, const uint8_t* data, uint32_t size, int64_t) { g_collectOut->emplace_back(data, data + size); }
 
 // Encodes 16-bit stereo PCM to raw AAC frames. Media Foundation must already be started.
-// *delay = samples the encoder adds in front (one frame).
+// *delay = samples the encoder adds in front (none with this encoder).
 static bool encodeAac(const std::vector<int16_t>& pcm, std::vector<std::vector<uint8_t>>& out, uint32_t* delay) {
     bool ok = false;
     Track enc;
@@ -553,7 +555,7 @@ static bool encodeAac(const std::vector<int16_t>& pcm, std::vector<std::vector<u
         enc.enc->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
         drainEncoder(enc, 0);
         ok = !out.empty();
-        *delay = FRAME;
+        *delay = 0;                                                               // see drainEncoder: no delay to skip
     }
     closeTrack(enc);
     g_cfg.onPacket = savedFn;

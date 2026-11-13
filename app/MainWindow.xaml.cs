@@ -56,13 +56,14 @@ public sealed partial class MainWindow : Window
 
     private void Nav_SelectionChanged(NavigationView sender, NavigationViewSelectionChangedEventArgs args)
     {
+        HideStatus();
         if (args.IsSettingsSelected) ContentFrame.Navigate(typeof(SettingsPage));
         else if (args.SelectedItem is NavigationViewItem item && (item.Tag as string) == "clips") ContentFrame.Navigate(typeof(ClipsPage));
     }
 
     /// <summary>Opens the editor for one clip (reached by clicking a clip on the Clips page).</summary>
-    public void OpenEditor(string clipPath) => ContentFrame.Navigate(typeof(EditorPage), clipPath);
+    public void OpenEditor(string clipPath) { HideStatus(); ContentFrame.Navigate(typeof(EditorPage), clipPath); }
 
     /// <summary>Back to the clip list, optionally scrolling to a clip.</summary>
-    public void ShowClips(string? select = null) => ContentFrame.Navigate(typeof(ClipsPage), select);
+    public void ShowClips(string? select = null) { HideStatus(); ContentFrame.Navigate(typeof(ClipsPage), select); }
 }

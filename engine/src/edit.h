@@ -459,8 +459,16 @@ static inline bool trim(const PathChar* in, const PathChar* out, int64_t startMs
                 sum[(size_t)m * 2 + 1] += (int32_t)pcm[(size_t)d * 2 + 1] * o.gain / 100;
             }
         }
+        // If the tracks together are louder than the format allows, turn the whole mix down just enough to fit,
+        // instead of letting the loud moments distort.
+        int64_t peak = 0;
+        for (int32_t x : sum) { const int64_t ax = x < 0 ? -(int64_t)x : x; if (ax > peak) peak = ax; }
+        const double scale = peak > 32000 ? 32000.0 / (double)peak : 1.0;
         std::vector<int16_t> mixed(sum.size());
-        for (size_t i = 0; i < sum.size(); i++) mixed[i] = (int16_t)(sum[i] > 32767 ? 32767 : sum[i] < -32768 ? -32768 : sum[i]);
+        for (size_t i = 0; i < sum.size(); i++) {
+            const double x = sum[i] * scale;
+            mixed[i] = (int16_t)(x > 32767 ? 32767 : x < -32768 ? -32768 : x);
+        }
         OutAudio one;
         one.src = outs.empty() ? 1 : outs[0].src; one.first = 0; one.count = 0; one.emptyMs = 0; one.gain = 100; one.name = "Mixed";
         uint32_t delay = 0;
