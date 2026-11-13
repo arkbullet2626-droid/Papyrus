@@ -70,6 +70,7 @@ struct Mp4Mux {
         uint32_t* sizes = nullptr;
         uint64_t* offs = nullptr;      // relative to the first byte of sample data
         uint32_t* sync = nullptr;      // video only: 1-based keyframe sample numbers
+        uint32_t* durs = nullptr;      // video only: how long each frame is shown, in videoTimescale units
         uint64_t  maxSamples = 0, n = 0;
         uint32_t  maxSync = 0, nSync = 0;
         char      name[32] = "";       // shown by players as the track name
@@ -79,6 +80,8 @@ struct Mp4Mux {
     };
 
     uint32_t width = 0, height = 0, fps = 0;
+    uint32_t videoTimescale = 0;       // 0 = fps, so a duration of 1 is one frame (what the recorder uses)
+    bool     inbandParamSets = false;  // true: keyframes carry their own VPS/SPS/PPS ("hev1"), so they may change mid-file
     Track    tr[MAX_TRACKS];
     uint64_t dataBytes = 0;            // running total, for callers that write samples back to back
     uint64_t overflow = 0;
@@ -94,9 +97,13 @@ struct Mp4Mux {
             if (!k.maxSamples) continue;
             k.sizes = (uint32_t*)calloc((size_t)k.maxSamples, sizeof(uint32_t));
             k.offs = (uint64_t*)calloc((size_t)k.maxSamples, sizeof(uint64_t));
-            if (t == 0) { k.maxSync = (uint32_t)(k.maxSamples / fps + 2) * 4; k.sync = (uint32_t*)calloc(k.maxSync, sizeof(uint32_t)); }
-            ok = ok && k.sizes && k.offs && (t != 0 || k.sync);
-            moovCap += (size_t)k.maxSamples * 12 + (size_t)k.maxSync * 4 + 2048;
+            if (t == 0) {
+                k.maxSync = (uint32_t)(k.maxSamples / fps + 2) * 4;
+                k.sync = (uint32_t*)calloc(k.maxSync, sizeof(uint32_t));
+                k.durs = (uint32_t*)calloc((size_t)k.maxSamples, sizeof(uint32_t));
+            }
+            ok = ok && k.sizes && k.offs && (t != 0 || (k.sync && k.durs));
+            moovCap += (size_t)k.maxSamples * (t == 0 ? 20 : 12) + (size_t)k.maxSync * 4 + 2048;
         }
         moov = (uint8_t*)malloc(moovCap);
         return ok && moov;
@@ -108,10 +115,12 @@ struct Mp4Mux {
     void setName(int track, const char* name) { strncpy(tr[track].name, name, sizeof tr[track].name - 1); }
 
     // Record one sample: `size` bytes at `relOffset` from the start of the sample data.
-    void add(int track, uint32_t size, bool keyframe, uint64_t relOffset) {
+    // `duration` (video only) is how long the frame is shown, in videoTimescale units.
+    void add(int track, uint32_t size, bool keyframe, uint64_t relOffset, uint32_t duration = 1) {
         if (!size || track < 0 || track >= MAX_TRACKS) return;
         Track& k = tr[track];
         if (k.n >= k.maxSamples) { overflow++; return; }
+        if (track == 0) k.durs[k.n] = duration ? duration : 1;
         k.offs[k.n] = relOffset;
         k.sizes[k.n++] = size;
         if (track == 0 && keyframe && k.nSync < k.maxSync) k.sync[k.nSync++] = (uint32_t)k.n;
@@ -135,9 +144,12 @@ struct Mp4Mux {
         return MDAT_HDR_LEN;
     }
 
+    uint32_t videoScale() const { return videoTimescale ? videoTimescale : fps; }
+    uint64_t videoTicks() const { uint64_t sum = 0; for (uint64_t i = 0; i < tr[0].n; i++) sum += tr[0].durs[i]; return sum; }
+
     uint32_t trackDurationMs(int t) const {
         const Track& k = tr[t];
-        if (t == 0) return (uint32_t)((k.n > k.skipSamples ? k.n - k.skipSamples : 0) * 1000 / fps) + k.emptyMs;   // for video, skipSamples counts frames
+        if (t == 0) return (uint32_t)(videoTicks() * 1000 / videoScale()) + k.emptyMs;
         const uint64_t samples = k.n * AUDIO_FRAME;
         uint64_t play = samples > k.skipSamples ? samples - k.skipSamples : 0;
         if (k.playSamples && k.playSamples < play) play = k.playSamples;
@@ -164,8 +176,8 @@ struct Mp4Mux {
             const Track& k = tr[t];
             if (!k.n) continue;
             const bool audio = t != 0;
-            const uint32_t timescale = audio ? (uint32_t)AUDIO_RATE : fps;
-            const uint32_t delta = audio ? (uint32_t)AUDIO_FRAME : 1;
+            const uint32_t timescale = audio ? (uint32_t)AUDIO_RATE : videoScale();
+            const uint64_t mediaTicks = audio ? k.n * AUDIO_FRAME : videoTicks();
             const uint32_t durTrack = trackDurationMs(t);
 
             size_t trak = w.begin("trak");
@@ -190,7 +202,7 @@ struct Mp4Mux {
             size_t mdia = w.begin("mdia");
             {
                 size_t b = w.begin("mdhd");
-                w.u32(0); w.u32(0); w.u32(0); w.u32(timescale); w.u32((uint32_t)(k.n * delta)); w.u16(0x55C4); w.u16(0);
+                w.u32(0); w.u32(0); w.u32(0); w.u32(timescale); w.u32((uint32_t)mediaTicks); w.u16(0x55C4); w.u16(0);
                 w.end(b);
                 b = w.begin("hdlr");
                 w.u32(0); w.u32(0); w.bytes(audio ? "soun" : "vide", 4); w.zero(12);
@@ -230,7 +242,7 @@ struct Mp4Mux {
                     w.end(esds);
                     w.end(mp4a);
                 } else {
-                    size_t hvc1 = w.begin("hvc1");
+                    size_t hvc1 = w.begin(inbandParamSets ? "hev1" : "hvc1");
                     w.zero(6); w.u16(1);
                     w.zero(16);
                     w.u16((uint16_t)width); w.u16((uint16_t)height);
@@ -238,7 +250,7 @@ struct Mp4Mux {
                     w.u16(1);
                     w.zero(32);
                     w.u16(0x0018); w.u16(0xFFFF);
-                    writeHvcC(w, ps);
+                    writeHvcC(w, ps, !inbandParamSets);
                     size_t colr = w.begin("colr");           // BT.709, limited range - matches what the engine encodes
                     w.bytes("nclx", 4); w.u16(1); w.u16(1); w.u16(1); w.u8(0);
                     w.end(colr);
@@ -247,7 +259,21 @@ struct Mp4Mux {
                 w.end(stsd);
 
                 size_t b = w.begin("stts");
-                w.u32(0); w.u32(1); w.u32((uint32_t)k.n); w.u32(delta);
+                if (audio) { w.u32(0); w.u32(1); w.u32((uint32_t)k.n); w.u32((uint32_t)AUDIO_FRAME); }
+                else {                                       // runs of frames with the same duration
+                    w.u32(0);
+                    const size_t countAt = w.n;
+                    w.u32(0);
+                    uint32_t runs = 0;
+                    for (uint64_t i = 0; i < k.n;) {
+                        uint64_t j = i;
+                        while (j < k.n && k.durs[j] == k.durs[i]) j++;
+                        w.u32((uint32_t)(j - i)); w.u32(k.durs[i]);
+                        runs++;
+                        i = j;
+                    }
+                    w.p[countAt] = (uint8_t)(runs >> 24); w.p[countAt + 1] = (uint8_t)(runs >> 16); w.p[countAt + 2] = (uint8_t)(runs >> 8); w.p[countAt + 3] = (uint8_t)runs;
+                }
                 w.end(b);
                 if (!audio) {
                     b = w.begin("stss");
@@ -297,7 +323,8 @@ private:
         w.u32(0); w.u32(0x00010000); w.u32(0);
         w.u32(0); w.u32(0); w.u32(0x40000000);
     }
-    static void writeHvcC(W& w, const HevcParamSets& ps) {
+    static void writeHvcC(W& w, const HevcParamSets& ps, bool complete) {
+        const uint8_t flag = complete ? 0x80 : 0x00;        // 0 = more parameter sets may follow inside the samples
         // Profile/tier/level live at the start of the SPS; undo emulation prevention (00 00 03) first.
         uint8_t s[64] = {};
         uint32_t o = 0, zeros = 0;
@@ -322,9 +349,9 @@ private:
         w.u16(0);
         w.u8((uint8_t)((layers << 3) | (nested << 2) | 3));
         w.u8(3);
-        w.u8(0x80 | 32); w.u16(1); w.u16((uint16_t)ps.vpsLen); w.bytes(ps.vps, ps.vpsLen);
-        w.u8(0x80 | 33); w.u16(1); w.u16((uint16_t)ps.spsLen); w.bytes(ps.sps, ps.spsLen);
-        w.u8(0x80 | 34); w.u16(1); w.u16((uint16_t)ps.ppsLen); w.bytes(ps.pps, ps.ppsLen);
+        w.u8(flag | 32); w.u16(1); w.u16((uint16_t)ps.vpsLen); w.bytes(ps.vps, ps.vpsLen);
+        w.u8(flag | 33); w.u16(1); w.u16((uint16_t)ps.spsLen); w.bytes(ps.sps, ps.spsLen);
+        w.u8(flag | 34); w.u16(1); w.u16((uint16_t)ps.ppsLen); w.bytes(ps.pps, ps.ppsLen);
         w.end(b);
     }
 };

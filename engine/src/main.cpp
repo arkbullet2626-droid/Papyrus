@@ -1223,6 +1223,88 @@ static DWORD WINAPI saveThread(void*) {
     return 0;
 }
 
+// Clip editor: black frames for the parts of an edited clip that have sound but no picture.
+// A black picture goes through the same GPU colour conversion and NVENC settings the recorder uses, so the frames
+// usually share the clip's parameter sets. Output: length-prefixed samples without parameter sets, first one a keyframe.
+static bool makeBlackFrames(uint32_t width, uint32_t height, uint32_t fps, int frames, std::vector<std::vector<uint8_t>>& samples, HevcParamSets& ps) {
+    if (frames <= 0) return false;
+    g_monitor = MonitorFromPoint(POINT{ 0, 0 }, MONITOR_DEFAULTTOPRIMARY);
+    g_cfg.fps = (int)fps;
+    g_cfg.preset = 0;
+    g_cfg.bitrateSet = false;
+    createDevice();
+    g_srcW = g_encW = width & ~1u;
+    g_srcH = g_encH = height & ~1u;
+    applyAutoTier();
+    createVideoProcessor();
+
+    const SIZE_T bytes = (SIZE_T)g_srcW * g_srcH * 4;
+    void* zeros = VirtualAlloc(nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);     // all zero = black
+    if (!zeros) return false;
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = g_srcW; td.Height = g_srcH; td.MipLevels = 1; td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM; td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT; td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    D3D11_SUBRESOURCE_DATA init{};
+    init.pSysMem = zeros; init.SysMemPitch = g_srcW * 4;
+    ID3D11Texture2D* tex = nullptr;
+    hrcheck(g_dev->CreateTexture2D(&td, &init, &tex), "Create black texture");
+    VirtualFree(zeros, 0, MEM_RELEASE);
+    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC iv{};
+    iv.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+    ID3D11VideoProcessorInputView* view = nullptr;
+    hrcheck(g_vdev->CreateVideoProcessorInputView(tex, g_vpEnum, &iv, &view), "Create black input view");
+
+    initEncoder();
+    static NV_ENC_PIC_PARAMS pp;
+    uint64_t submitted = 0, completed = 0;
+    auto complete = [&]() {
+        const int idx = (int)(completed % POOL);
+        if (g_async && WaitForSingleObject(g_ev[idx], 10000) != WAIT_OBJECT_0) fatal("NVENC did not finish a frame within 10 seconds");
+        NV_ENC_LOCK_BITSTREAM lb{};
+        lb.version = NV_ENC_LOCK_BITSTREAM_VER;
+        lb.outputBitstream = g_bs[idx];
+        nvcheck(g_nv.nvEncLockBitstream(g_enc, &lb), "LockBitstream");
+        std::vector<uint8_t> sample;
+        hevcToLengthPrefixed((const uint8_t*)lb.bitstreamBufferPtr, lb.bitstreamSizeInBytes, ps,
+                             [&](const uint8_t* d, uint32_t n) { sample.insert(sample.end(), d, d + n); });
+        samples.push_back(std::move(sample));
+        nvcheck(g_nv.nvEncUnlockBitstream(g_enc, g_bs[idx]), "UnlockBitstream");
+        nvcheck(g_nv.nvEncUnmapInputResource(g_enc, g_mapped[idx]), "UnmapInputResource");
+        completed++;
+    };
+    for (int k = 0; k < frames; k++) {
+        while (submitted - completed >= POOL) complete();
+        const int idx = (int)(submitted % POOL);
+        D3D11_VIDEO_PROCESSOR_STREAM stream{};
+        stream.Enable = TRUE;
+        stream.pInputSurface = view;
+        hrcheck(g_vctx->VideoProcessorBlt(g_vp, g_nv12View[idx], 0, 1, &stream), "GPU colour conversion");
+        NV_ENC_MAP_INPUT_RESOURCE map{};
+        map.version = NV_ENC_MAP_INPUT_RESOURCE_VER;
+        map.registeredResource = g_reg[idx];
+        nvcheck(g_nv.nvEncMapInputResource(g_enc, &map), "MapInputResource");
+        g_mapped[idx] = map.mappedResource;
+        memset(&pp, 0, sizeof pp);
+        pp.version = NV_ENC_PIC_PARAMS_VER;
+        pp.inputWidth = g_encW; pp.inputHeight = g_encH; pp.inputPitch = g_encW;
+        pp.inputBuffer = map.mappedResource;
+        pp.bufferFmt = map.mappedBufferFmt;
+        pp.outputBitstream = g_bs[idx];
+        pp.completionEvent = g_async ? g_ev[idx] : nullptr;
+        pp.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
+        pp.inputTimeStamp = (uint64_t)k;
+        pp.inputDuration = 1;
+        nvcheck(g_nv.nvEncEncodePicture(g_enc, &pp), "EncodePicture");
+        submitted++;
+    }
+    while (completed < submitted) complete();
+    destroyEncoder();
+    view->Release();
+    tex->Release();
+    return !samples.empty() && ps.complete();
+}
+
 static BOOL WINAPI ctrlHandler(DWORD type) {
     if (type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT || type == CTRL_CLOSE_EVENT) {
         g_stop.store(true);
@@ -1383,7 +1465,8 @@ int wmain(int argc, wchar_t** argv) {
         else {
             aud::g_cfg.qpcFreq = g_qpf;
             int64_t actual = 0;
-            ok = edit::trim(g_cfg.editIn, g_cfg.out, g_cfg.editStart, g_cfg.editEnd, g_cfg.edits, 4, aud::regain, &actual, err);
+            wcscpy(g_errPath, errPath);                  // if the graphics card cannot make the black frames, say why
+            ok = edit::trim(g_cfg.editIn, g_cfg.out, g_cfg.editStart, g_cfg.editEnd, g_cfg.edits, 4, aud::regain, makeBlackFrames, &actual, err);
             if (!ok) DeleteFileW(g_cfg.out);
         }
         if (!ok) writeSmallFile(errPath, err.c_str());

@@ -2,9 +2,10 @@
 //
 // Reads a Papyrus MP4, keeps a time range of it, and writes a new MP4:
 //   - the video is copied as it is. The cut can start on ANY frame: the file carries the frames from the keyframe
-//     before it (keyframes are 1 s apart) and an edit list tells the player to start showing at the chosen frame;
+//     before it (keyframes are 1 s apart), and those lead-in frames are given a display time of practically zero, so
+//     every player starts on the chosen frame without needing edit-list support;
 //   - each sound track can be kept or dropped and has its own start and end, which may reach outside the video's
-//     range; it is copied as it is;
+//     range. Where there is sound but no picture, black frames are inserted (made by `black`, Windows only);
 //   - a track whose volume was changed is the only thing that gets re-encoded (through `regain`, Windows only).
 // Plain C++ (no Windows calls) so the copy path is tested off-Windows. Editing is a one-off job, so unlike the
 // recorder this code is allowed to allocate.
@@ -13,6 +14,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <map>
 #include <vector>
 #include "mp4.h"
 
@@ -36,6 +38,8 @@ struct InTrack {
     std::vector<uint32_t> sizes;
     std::vector<uint64_t> offs;
     std::vector<uint32_t> sync;        // 1-based keyframe sample numbers (video)
+    std::vector<uint32_t> deltas;      // how long each sample lasts, in timescale units
+    bool inband = false;               // video: keyframes carry their own parameter sets ("hev1")
     HevcParamSets ps;
 };
 
@@ -105,6 +109,7 @@ static inline bool parseTrack(const uint8_t* trak, size_t n, InTrack& t) {
     if (!t.audio) {
         const uint8_t* stsd = findBox(stbl, sl, "stsd", &len);
         if (!stsd) return false;
+        for (size_t i = 0; i + 4 <= len; i++) if (!memcmp(stsd + i, "hev1", 4)) { t.inband = true; break; }
         const uint8_t* h = nullptr;
         for (size_t i = 0; i + 4 <= len; i++) if (!memcmp(stsd + i, "hvcC", 4)) { h = stsd + i + 4; len -= i + 4; break; }
         if (!h || len < 23) return false;
@@ -135,6 +140,17 @@ static inline bool parseTrack(const uint8_t* trak, size_t n, InTrack& t) {
     if (!fixed && 12 + (size_t)count * 4 > len) return false;
     t.sizes.resize(count);
     for (uint32_t i = 0; i < count; i++) t.sizes[i] = fixed ? fixed : be32(stsz + 12 + i * 4);
+    t.deltas.assign(count, t.audio ? (uint32_t)Mp4Mux::AUDIO_FRAME : 1);
+    if (const uint8_t* stts = findBox(stbl, sl, "stts", &len)) {
+        const uint32_t runs = be32(stts + 4);
+        uint32_t at = 0, last = t.deltas.empty() ? 1 : t.deltas[0];
+        for (uint32_t r = 0; r < runs && 8 + (size_t)(r + 1) * 8 <= len; r++) {
+            const uint32_t c2 = be32(stts + 8 + r * 8);
+            last = be32(stts + 12 + r * 8);
+            for (uint32_t k = 0; k < c2 && at < count; k++) t.deltas[at++] = last;
+        }
+        while (at < count) t.deltas[at++] = last;
+    }
 
     // chunk offsets + sample-to-chunk map -> one offset per sample
     std::vector<uint64_t> chunks;
@@ -200,15 +216,40 @@ static inline double audioDurationMs(const InTrack& t) {
     return t.emptyMs + (samples > 0 ? samples : 0) * 1000.0 / (double)Mp4Mux::AUDIO_RATE;
 }
 
-// Writes a description of the clip for the Studio app: one "key=value" per line.
+// When each video frame appears, in seconds on the clip's timeline (negative = a hidden lead-in frame).
+// Returns the time the last frame stops being shown.
+static inline double videoTimes(const InTrack& v, std::vector<double>& times) {
+    times.resize(v.sizes.size());
+    const double ts = v.timescale ? (double)v.timescale : 1.0;
+    uint64_t cum = 0;
+    for (size_t i = 0; i < times.size(); i++) {
+        times[i] = v.emptyMs / 1000.0 + ((double)cum - (double)v.skipSamples) / ts;
+        cum += v.deltas[i];
+    }
+    return v.emptyMs / 1000.0 + ((double)cum - (double)v.skipSamples) / ts;
+}
+
+// The frame rate the clip was recorded at: from the most common frame duration.
+static inline uint32_t nominalFps(const InTrack& v) {
+    std::map<uint32_t, uint32_t> hist;
+    for (uint32_t d : v.deltas) hist[d]++;
+    uint32_t best = 1, bestCount = 0;
+    for (auto& kv : hist) if (kv.second > bestCount) { best = kv.first; bestCount = kv.second; }
+    const uint32_t fps = best ? (uint32_t)((double)v.timescale / best + 0.5) : 0;
+    return fps ? fps : 60;
+}
+
+// Writes a description of the clip for the Papyrus app: one "key=value" per line.
 static inline bool writeInfo(const PathChar* in, const PathChar* out, std::string& err) {
     Clip c;
     if (!load(in, c, err)) return false;
     FILE* o = openFile(out, L"wb");
     if (!o) { err = "could not write the info file"; return false; }
     const InTrack& v = c.tracks[0];
-    fprintf(o, "width=%u\nheight=%u\nfps=%u\nframes=%u\ndurationMs=%.0f\nkeyframes=%u\n", v.width, v.height, v.timescale,
-            (unsigned)v.sizes.size(), (double)v.sizes.size() * 1000.0 / v.timescale, (unsigned)v.sync.size());
+    std::vector<double> times;
+    const double seconds = videoTimes(v, times);
+    fprintf(o, "width=%u\nheight=%u\nfps=%u\nframes=%u\ndurationMs=%.0f\nkeyframes=%u\n", v.width, v.height, nominalFps(v),
+            (unsigned)v.sizes.size(), seconds * 1000.0, (unsigned)v.sync.size());
     for (size_t i = 1; i < c.tracks.size(); i++)
         fprintf(o, "audio=%u|%s|%.0f|%u\n", (unsigned)i, c.tracks[i].name, audioDurationMs(c.tracks[i]), c.tracks[i].emptyMs);
     fclose(o);
@@ -226,7 +267,8 @@ static inline bool writePeaks(const PathChar* in, const PathChar* out, int bucke
     if (!decode) { err = "waveforms are not available here"; return false; }
     FILE* o = openFile(out, L"wb");
     if (!o) { err = "could not write the waveform file"; return false; }
-    const double clipSeconds = (double)c.tracks[0].sizes.size() / c.tracks[0].timescale;
+    std::vector<double> frameTimes;
+    const double clipSeconds = videoTimes(c.tracks[0], frameTimes);
     for (size_t i = 1; i < c.tracks.size(); i++) {
         const InTrack& a = c.tracks[i];
         std::vector<std::vector<uint8_t>> pk(a.sizes.size());
@@ -260,32 +302,55 @@ static inline bool writePeaks(const PathChar* in, const PathChar* out, int bucke
     return true;
 }
 
-// startMs/endMs: the part of the clip to keep (endMs < 0 = to the end). edits[i] applies to the i-th sound track.
+// Makes `frames` black video frames of the given size (first one a keyframe) as length-prefixed HEVC samples
+// without parameter sets, and reports the parameter sets they need. Windows only (uses the graphics card's encoder).
+typedef bool (*BlackFn)(uint32_t width, uint32_t height, uint32_t fps, int frames, std::vector<std::vector<uint8_t>>& samples, HevcParamSets& ps);
+
+static inline void appendNal(std::vector<uint8_t>& out, const uint8_t* nal, uint32_t len) {
+    const uint8_t be[4] = { (uint8_t)(len >> 24), (uint8_t)(len >> 16), (uint8_t)(len >> 8), (uint8_t)len };
+    out.insert(out.end(), be, be + 4);
+    out.insert(out.end(), nal, nal + len);
+}
+static inline std::vector<uint8_t> paramSetPrefix(const HevcParamSets& ps) {
+    std::vector<uint8_t> out;
+    appendNal(out, ps.vps, ps.vpsLen); appendNal(out, ps.sps, ps.spsLen); appendNal(out, ps.pps, ps.ppsLen);
+    return out;
+}
+static inline bool sameParamSets(const HevcParamSets& a, const HevcParamSets& b) {
+    return a.vpsLen == b.vpsLen && a.spsLen == b.spsLen && a.ppsLen == b.ppsLen &&
+           !memcmp(a.vps, b.vps, a.vpsLen) && !memcmp(a.sps, b.sps, a.spsLen) && !memcmp(a.pps, b.pps, a.ppsLen);
+}
+
+// startMs/endMs: the part of the clip's picture to keep (endMs < 0 = to the end). edits[i] applies to the i-th sound track.
 // On success *actualStartMs is where the new clip's picture starts (the chosen frame).
 static inline bool trim(const PathChar* in, const PathChar* out, int64_t startMs, int64_t endMs, const TrackEdit* edits, int nEdits,
-                        RegainFn regain, int64_t* actualStartMs, std::string& err) {
+                        RegainFn regain, BlackFn black, int64_t* actualStartMs, std::string& err) {
     Clip c;
     if (!load(in, c, err)) return false;
     const InTrack& v = c.tracks[0];
-    const uint32_t fps = v.timescale;
+    const uint32_t fps = nominalFps(v);
     const int64_t nFrames = (int64_t)v.sizes.size();
+    std::vector<double> times;
+    const double srcEnd = videoTimes(v, times);
 
-    int64_t fs = (startMs * fps + 500) / 1000;
-    if (fs < 0) fs = 0;
-    int64_t fe = endMs < 0 ? nFrames : (endMs * fps + 500) / 1000;
-    if (fe > nFrames) fe = nFrames;
-    int64_t key = 0;                                            // 0-based index of the keyframe we start on
-    for (uint32_t s : v.sync) if ((int64_t)s - 1 <= fs) key = (int64_t)s - 1;
+    // The frames that will be shown: [fs, fe). The copy starts at the keyframe at or before fs.
+    const double S = startMs / 1000.0, E = endMs < 0 ? srcEnd + 1 : endMs / 1000.0;
+    int64_t fs = 0;
+    while (fs < nFrames && (times[(size_t)fs] < S - 0.0005 || times[(size_t)fs] < -0.0000001)) fs++;
+    int64_t fe = fs;
+    while (fe < nFrames && times[(size_t)fe] < E - 0.0005) fe++;
     if (fs >= fe) { err = "the selected part is empty"; return false; }
-    const double vStart = (double)fs / fps, vEnd = (double)fe / fps;             // what the viewer sees, in seconds on the original clip
-    const double keyTime = (double)key / fps;                                    // where the copied video data really starts
+    int64_t key = 0;
+    for (uint32_t s : v.sync) if ((int64_t)s - 1 <= fs) key = (int64_t)s - 1;
+    const double vStart = times[(size_t)fs];
+    const double vEnd = fe < nFrames ? times[(size_t)fe] : srcEnd;
     if (actualStartMs) *actualStartMs = (int64_t)(vStart * 1000.0 + 0.5);
 
-    struct OutAudio { int src; int64_t first, count; uint32_t emptyMs, skip; uint64_t play; double t0; std::vector<std::vector<uint8_t>> re; };
+    // What each sound track keeps. A track may start before the picture or end after it.
     struct Want { int src; double t0, t1; TrackEdit e; };
     std::vector<Want> wants;
     const double R = Mp4Mux::AUDIO_RATE, F = Mp4Mux::AUDIO_FRAME;
-    double movieStart = vStart;                                                  // the earliest thing in the new clip
+    double movieStart = vStart, movieEnd = vEnd;
     for (size_t i = 1; i < c.tracks.size(); i++) {
         const TrackEdit e = (int)(i - 1) < nEdits ? edits[i - 1] : TrackEdit{};
         if (!e.keep || e.gainPercent <= 0) continue;
@@ -297,27 +362,44 @@ static inline bool trim(const PathChar* in, const PathChar* out, int64_t startMs
         if (t1 > trackEnd) t1 = trackEnd;
         if (t1 - t0 < 0.02) continue;                                            // nothing of this track is left
         if (t0 < movieStart) movieStart = t0;
+        if (t1 > movieEnd) movieEnd = t1;
         wants.push_back({ (int)i, t0, t1, e });
     }
-    const bool simple = vStart - movieStart < 0.0005;                            // no sound starts before the picture
 
+    // Sound without picture gets black frames.
+    int64_t nLead = (int64_t)((vStart - movieStart) * fps + 0.5), nTail = (int64_t)((movieEnd - vEnd) * fps + 0.5);
+    std::vector<std::vector<uint8_t>> blackSamples;
+    HevcParamSets blackPs;
+    if (nLead > 0 || nTail > 0) {
+        if (!black) { err = "black frames for sound-only parts are not available here"; return false; }
+        if (!black(v.width, v.height, fps, (int)(nLead > nTail ? nLead : nTail), blackSamples, blackPs) || blackSamples.empty() || !blackPs.complete()) {
+            err = "could not make the black frames for the sound-only part";
+            return false;
+        }
+        if (nLead > (int64_t)blackSamples.size()) nLead = (int64_t)blackSamples.size();
+        if (nTail > (int64_t)blackSamples.size()) nTail = (int64_t)blackSamples.size();
+    }
+    const bool haveBlack = nLead > 0 || nTail > 0;
+    // If the black frames need different parameter sets from the clip, every keyframe carries its own.
+    const bool mixed = haveBlack && !sameParamSets(blackPs, v.ps);
+    const bool inband = v.inband || mixed;
+    const std::vector<uint8_t> origPrefix = (inband && !v.inband) ? paramSetPrefix(v.ps) : std::vector<uint8_t>();
+    const std::vector<uint8_t> blackPrefix = (inband && haveBlack) ? paramSetPrefix(blackPs) : std::vector<uint8_t>();
+
+    struct OutAudio { int src; int64_t first, count; uint32_t emptyMs, skip; uint64_t play; std::vector<std::vector<uint8_t>> re; };
     std::vector<OutAudio> outs;
     for (const Want& w : wants) {
         const InTrack& a = c.tracks[(size_t)w.src];
         const double trackStart = a.emptyMs / 1000.0;
         auto pos = [&](double t) { return (int64_t)((t - trackStart) * R + 0.5) + (int64_t)a.skipSamples; };   // sample position in the stored stream
         const int64_t p0 = pos(w.t0), p1 = pos(w.t1);
-        // A track that starts with the picture is copied from the same keyframe as the video, so a player that
-        // ignores edit lists still plays picture and sound together (just starting a little early).
-        int64_t from = p0;
-        if (simple && w.t0 - vStart < 0.0005 && keyTime < vStart) { from = pos(keyTime); if (from < (int64_t)a.skipSamples) from = (int64_t)a.skipSamples; }
-        int64_t first = from / (int64_t)F;
+        int64_t first = p0 / (int64_t)F;
         if (first > 0) first--;                                                  // one packet of run-in so the decoder starts clean
         int64_t last = (p1 - 1) / (int64_t)F;
         if (last >= (int64_t)a.sizes.size()) last = (int64_t)a.sizes.size() - 1;
         if (last < first) continue;
         OutAudio o;
-        o.src = w.src; o.first = first; o.count = last - first + 1; o.t0 = w.t0;
+        o.src = w.src; o.first = first; o.count = last - first + 1;
         o.skip = (uint32_t)(p0 - first * (int64_t)F);
         o.play = (uint64_t)(p1 - p0);
         o.emptyMs = (uint32_t)((w.t0 - movieStart) * 1000.0 + 0.5);
@@ -336,40 +418,74 @@ static inline bool trim(const PathChar* in, const PathChar* out, int64_t startMs
         outs.push_back(std::move(o));
     }
 
-    // Build the index. Samples are laid out in time order so the file plays smoothly from any disk.
+    // The video, in order: black lead, hidden lead-in frames (keyframe up to the cut), the shown frames, black tail.
+    // Time is counted in 1/(fps*1000) s: a normal frame lasts 1000, a hidden lead-in frame lasts 1.
+    const uint32_t outScale = fps * 1000;
+    struct VItem { bool isBlack; int64_t idx; uint32_t dur; bool key; };
+    std::vector<VItem> video;
+    auto blackKey = [&](int64_t i) {                         // does this sample hold a keyframe slice?
+        const auto& b = blackSamples[(size_t)i];
+        for (size_t o = 0; o + 5 <= b.size();) {
+            const uint32_t len = be32(b.data() + o);
+            const int t = (b[o + 4] >> 1) & 0x3F;
+            if (t >= 16 && t <= 21) return true;
+            o += 4 + (size_t)len;
+        }
+        return false;
+    };
+    auto origKey = [&](int64_t i) { for (uint32_t s : v.sync) if ((int64_t)s - 1 == i) return true; return false; };
+    for (int64_t i = 0; i < nLead; i++) video.push_back({ true, i, 1000, blackKey(i) });
+    for (int64_t f = key; f < fs; f++) video.push_back({ false, f, 1, origKey(f) });
+    for (int64_t f = fs; f < fe; f++) {
+        double d = (double)v.deltas[(size_t)f] / v.timescale * outScale + 0.5;
+        video.push_back({ false, f, d < 1 ? 1u : (uint32_t)d, origKey(f) });
+    }
+    for (int64_t i = 0; i < nTail; i++) video.push_back({ true, i, 1000, blackKey(i) });
+
     Mp4Mux m;
     uint64_t maxAudio = 1;
     for (auto& o : outs) { const uint64_t n = o.re.empty() ? (uint64_t)o.count : o.re.size(); if (n > maxAudio) maxAudio = n; }
-    if (!m.init((uint64_t)(fe - key), maxAudio, v.width, v.height, fps)) { err = "out of memory"; return false; }
-    m.tr[0].skipSamples = (uint32_t)(fs - key);                                  // frames before the cut: decoded, not shown
-    m.tr[0].emptyMs = (uint32_t)((vStart - movieStart) * 1000.0 + 0.5);          // sound that starts before the picture
-    struct Item { int track; int64_t idx; };
+    if (!m.init((uint64_t)video.size(), maxAudio, v.width, v.height, fps)) { err = "out of memory"; return false; }
+    m.videoTimescale = outScale;
+    m.inbandParamSets = inband;
+
+    // Lay samples out in time order so the file plays smoothly from any disk.
+    struct Item { int track; int64_t idx; };                 // track 0: idx into `video`; else idx into that sound track
     std::vector<Item> order;
     std::vector<int64_t> cur(outs.size(), 0);
-    auto audioTime = [&](size_t a) { return outs[a].emptyMs / 1000.0 + ((double)cur[a] * F - outs[a].skip) / R; };   // on the new clip's timeline
-    for (int64_t f = key; f < fe; f++) {
-        const double tv = m.tr[0].emptyMs / 1000.0 + (double)(f - fs) / fps;
+    auto audioTime = [&](size_t a) { return outs[a].emptyMs / 1000.0 + ((double)cur[a] * F - outs[a].skip) / R; };
+    uint64_t ticks = 0;
+    for (size_t i = 0; i < video.size(); i++) {
+        const double tv = (double)ticks / outScale;
         for (size_t a = 0; a < outs.size(); a++) {
             const int64_t n = outs[a].re.empty() ? outs[a].count : (int64_t)outs[a].re.size();
             while (cur[a] < n && audioTime(a) <= tv) order.push_back({ (int)a + 1, cur[a]++ });
         }
-        order.push_back({ 0, f });
+        order.push_back({ 0, (int64_t)i });
+        ticks += video[i].dur;
     }
     for (size_t a = 0; a < outs.size(); a++) {
         const int64_t n = outs[a].re.empty() ? outs[a].count : (int64_t)outs[a].re.size();
         while (cur[a] < n) order.push_back({ (int)a + 1, cur[a]++ });
     }
-    uint64_t rel = 0;
+    auto prefixOf = [&](const VItem& it) -> const std::vector<uint8_t>* {
+        static const std::vector<uint8_t> none;
+        if (!it.key) return &none;
+        return it.isBlack ? &blackPrefix : &origPrefix;
+    };
     auto sizeOf = [&](const Item& it) -> uint32_t {
-        if (it.track == 0) return v.sizes[(size_t)it.idx];
+        if (it.track == 0) {
+            const VItem& vi = video[(size_t)it.idx];
+            return (uint32_t)prefixOf(vi)->size() + (vi.isBlack ? (uint32_t)blackSamples[(size_t)vi.idx].size() : v.sizes[(size_t)vi.idx]);
+        }
         const OutAudio& o = outs[(size_t)it.track - 1];
         return o.re.empty() ? c.tracks[(size_t)o.src].sizes[(size_t)(o.first + it.idx)] : (uint32_t)o.re[(size_t)it.idx].size();
     };
+    uint64_t rel = 0;
     for (const Item& it : order) {
-        bool isKey = false;
-        if (it.track == 0) for (uint32_t s : v.sync) if ((int64_t)s - 1 == it.idx) { isKey = true; break; }
         const uint32_t sz = sizeOf(it);
-        m.add(it.track, sz, isKey, rel);
+        if (it.track == 0) m.add(0, sz, video[(size_t)it.idx].key, rel, video[(size_t)it.idx].dur);
+        else m.add(it.track, sz, false, rel);
         rel += sz;
     }
     for (size_t a = 0; a < outs.size(); a++) {
@@ -390,17 +506,27 @@ static inline bool trim(const PathChar* in, const PathChar* out, int64_t startMs
     ok = ok && fwrite(m.moov, 1, moovLen, o) == moovLen;
     ok = ok && fwrite(hdr, 1, Mp4Mux::writeMdatHeader(hdr, rel), o) == Mp4Mux::MDAT_HDR_LEN;
     std::vector<uint8_t> buf(1 << 20);
+    auto copyFromSource = [&](uint64_t off, uint32_t sz) {
+        if (sz > buf.size()) buf.resize(sz);
+        return !PAPYRUS_FSEEK(c.f, (long long)off, SEEK_SET) && fread(buf.data(), 1, sz, c.f) == sz && fwrite(buf.data(), 1, sz, o) == sz;
+    };
     for (size_t i = 0; ok && i < order.size(); i++) {
         const Item& it = order[i];
-        const uint32_t sz = sizeOf(it);
-        if (it.track != 0 && !outs[(size_t)it.track - 1].re.empty()) {
-            ok = fwrite(outs[(size_t)it.track - 1].re[(size_t)it.idx].data(), 1, sz, o) == sz;
+        if (it.track == 0) {
+            const VItem& vi = video[(size_t)it.idx];
+            const std::vector<uint8_t>* pre = prefixOf(vi);
+            if (!pre->empty()) ok = fwrite(pre->data(), 1, pre->size(), o) == pre->size();
+            if (!ok) break;
+            if (vi.isBlack) { const auto& b = blackSamples[(size_t)vi.idx]; ok = fwrite(b.data(), 1, b.size(), o) == b.size(); }
+            else ok = copyFromSource(v.offs[(size_t)vi.idx], v.sizes[(size_t)vi.idx]);
             continue;
         }
-        const uint64_t off = it.track == 0 ? v.offs[(size_t)it.idx]
-                                           : c.tracks[(size_t)outs[(size_t)it.track - 1].src].offs[(size_t)(outs[(size_t)it.track - 1].first + it.idx)];
-        if (sz > buf.size()) buf.resize(sz);
-        ok = !PAPYRUS_FSEEK(c.f, (long long)off, SEEK_SET) && fread(buf.data(), 1, sz, c.f) == sz && fwrite(buf.data(), 1, sz, o) == sz;
+        const OutAudio& oa = outs[(size_t)it.track - 1];
+        if (!oa.re.empty()) { const auto& b = oa.re[(size_t)it.idx]; ok = fwrite(b.data(), 1, b.size(), o) == b.size(); }
+        else {
+            const InTrack& a = c.tracks[(size_t)oa.src];
+            ok = copyFromSource(a.offs[(size_t)(oa.first + it.idx)], a.sizes[(size_t)(oa.first + it.idx)]);
+        }
     }
     ok = fclose(o) == 0 && ok;
     if (!ok) { err = "could not write the new clip (disk full?)"; return false; }
