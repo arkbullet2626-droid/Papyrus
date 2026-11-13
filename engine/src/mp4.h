@@ -73,8 +73,8 @@ struct Mp4Mux {
         uint64_t  maxSamples = 0, n = 0;
         uint32_t  maxSync = 0, nSync = 0;
         char      name[32] = "";       // shown by players as the track name
-        uint32_t  emptyMs = 0;         // audio: silence before the first sample (lines the track up with the video)
-        uint32_t  skipSamples = 0;     // audio: samples to skip at the start
+        uint32_t  emptyMs = 0;         // nothing plays on this track for this long at the start (lines tracks up with each other)
+        uint32_t  skipSamples = 0;     // audio: samples to skip at the start; video: frames decoded but not shown (frame-exact cut)
         uint64_t  playSamples = 0;     // audio: samples to play after the skip (0 = everything that is left)
     };
 
@@ -137,7 +137,7 @@ struct Mp4Mux {
 
     uint32_t trackDurationMs(int t) const {
         const Track& k = tr[t];
-        if (t == 0) return (uint32_t)(k.n * 1000 / fps);
+        if (t == 0) return (uint32_t)((k.n > k.skipSamples ? k.n - k.skipSamples : 0) * 1000 / fps) + k.emptyMs;   // for video, skipSamples counts frames
         const uint64_t samples = k.n * AUDIO_FRAME;
         uint64_t play = samples > k.skipSamples ? samples - k.skipSamples : 0;
         if (k.playSamples && k.playSamples < play) play = k.playSamples;
@@ -179,7 +179,7 @@ struct Mp4Mux {
                 w.u32(audio ? 0 : width << 16); w.u32(audio ? 0 : height << 16);
                 w.end(b);
             }
-            if (audio && (k.emptyMs || k.skipSamples || k.playSamples)) {
+            if (k.emptyMs || k.skipSamples || (audio && k.playSamples)) {
                 size_t edts = w.begin("edts");
                 size_t elst = w.begin("elst");
                 w.u32(0); w.u32(k.emptyMs ? 2 : 1);

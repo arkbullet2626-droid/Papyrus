@@ -20,7 +20,7 @@ public sealed partial class EditorPage : Page
     public EditorPage()
     {
         InitializeComponent();
-        _videoBar = new RangeBar(Windows.UI.Color.FromArgb(255, 230, 60, 60), true) { StartStep = 1, MinLength = 1 };
+        _videoBar = new RangeBar(Windows.UI.Color.FromArgb(255, 230, 60, 60), true) { MinLength = 0.25 };
         _videoBar.RangeChanged += ClipRangeChanged;
         _videoBar.SeekRequested += Seek;
         VideoBarHost.Children.Add(_videoBar);
@@ -44,6 +44,8 @@ public sealed partial class EditorPage : Page
         public RadioButton Listen = null!;
         public CheckBox Keep = null!;
         public RangeBar Bar = null!;
+        public TextBlock Mode = null!;
+        public bool Custom;                // the user moved this track's bars: it no longer follows the clip
         public Slider Volume = null!;
     }
 
@@ -55,7 +57,6 @@ public sealed partial class EditorPage : Page
     private bool _playingSelection;
     private bool _loading;
     private RangeBar _videoBar = null!;
-    private double _prevClipStart, _prevClipEnd;        // where the clip bars were before the last move
     private static readonly Windows.UI.Color[] TrackColors =
     {
         Windows.UI.Color.FromArgb(255, 76, 175, 80), Windows.UI.Color.FromArgb(255, 30, 215, 96),
@@ -69,7 +70,7 @@ public sealed partial class EditorPage : Page
     {
         if (seconds < 0) seconds = 0;
         int m = (int)(seconds / 60);
-        return string.Format(CultureInfo.InvariantCulture, "{0}:{1:00.0}", m, seconds - m * 60);
+        return string.Format(CultureInfo.InvariantCulture, "{0}:{1:00.000}", m, seconds - m * 60);
     }
 
     private TimeSpan Position
@@ -137,6 +138,7 @@ public sealed partial class EditorPage : Page
         NoTracksLabel.Visibility = _tracks.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
         ClipTitle.Text = string.Format(CultureInfo.InvariantCulture, "{0}   ·   {1}x{2}, {3} fps, {4}", Path.GetFileName(path), width, height, fps, Clock(_duration));
 
+        _videoBar.StartStep = fps > 0 ? 1.0 / fps : 0;      // the bars move one frame at a time
         _videoBar.Reset(_duration);
         foreach (var t in _tracks) t.Bar.Reset(_duration);
         SyncTracksToClip();
@@ -180,6 +182,9 @@ public sealed partial class EditorPage : Page
         row.Bar = new RangeBar(color, false) { MinLength = 0.2 };
         row.Bar.Reset(_duration > 0 ? _duration : 1);
         row.Bar.SeekRequested += Seek;
+        row.Bar.RangeChanged += () => { row.Custom = true; ShowMode(row); };
+        row.Mode = new TextBlock { FontSize = 12, Opacity = 0.65 };
+        ShowMode(row);
         // A track that is left out is shown faded.
         row.Keep.Checked += (_, _) => row.Bar.Opacity = 1;
         row.Keep.Unchecked += (_, _) => row.Bar.Opacity = 0.35;
@@ -187,6 +192,7 @@ public sealed partial class EditorPage : Page
         var block = new StackPanel { Spacing = 6 };
         block.Children.Add(header);
         block.Children.Add(row.Bar);
+        block.Children.Add(row.Mode);
         TracksPanel.Children.Add(block);
         _tracks.Add(row);
     }
@@ -205,39 +211,22 @@ public sealed partial class EditorPage : Page
     // Trimming
     // ---------------------------------------------------------------------------------------------------------
     /// <summary>
-    /// The clip bars moved. A sound-track bar that was sitting on a clip bar moves with it, so tracks stay the same
-    /// length as the clip unless they were shortened on purpose. No track may reach outside the clip.
+    /// The clip bars moved. Sound-track bars do NOT move with them: a track the user has not touched is simply cut
+    /// with the clip when saving, and a track the user has moved keeps exactly its own range, even outside the clip.
+    /// The clip's ends are offered as snap points so a track bar can be lined up with them easily.
     /// </summary>
     private void ClipRangeChanged()
     {
-        double start = _videoBar.Start, end = _videoBar.End;
-        foreach (var t in _tracks)
-        {
-            double ts = t.Bar.Start, te = t.Bar.End;
-            if (Math.Abs(ts - _prevClipStart) < 0.01 || ts < start) ts = start;
-            if (Math.Abs(te - _prevClipEnd) < 0.01 || te > end) te = end;
-            if (te < ts) te = ts;
-            ApplyClipBounds(t.Bar);
-            t.Bar.SetRange(ts, te);
-        }
-        _prevClipStart = start;
-        _prevClipEnd = end;
+        foreach (var t in _tracks) t.Bar.SnapPoints = new[] { _videoBar.Start, _videoBar.End };
         UpdateTrimLabels();
     }
 
-    /// <summary>A sound-track bar stays inside the clip and snaps to the clip's ends when dragged near them.</summary>
-    private void ApplyClipBounds(RangeBar bar)
-    {
-        bar.BoundStart = _videoBar.Start;
-        bar.BoundEnd = _videoBar.End;
-        bar.SnapPoints = new[] { _videoBar.Start, _videoBar.End };
-    }
+    private static void ShowMode(TrackRow t) =>
+        t.Mode.Text = t.Custom ? "Own range: plays exactly where its bars are" : "Follows the clip: cut where the clip is cut";
 
     private void SyncTracksToClip()
     {
-        _prevClipStart = _videoBar.Start;
-        _prevClipEnd = _videoBar.End;
-        foreach (var t in _tracks) { ApplyClipBounds(t.Bar); t.Bar.SetRange(_videoBar.Start, _videoBar.End); }
+        foreach (var t in _tracks) { t.Custom = false; ShowMode(t); t.Bar.SnapPoints = new[] { _videoBar.Start, _videoBar.End }; }
     }
 
     private void UpdateTrimLabels()
@@ -288,16 +277,17 @@ public sealed partial class EditorPage : Page
         var args = new List<string>
         {
             "--edit", source, "--out", output,
-            "--start", ((long)(_videoBar.Start * 1000)).ToString(CultureInfo.InvariantCulture),
-            "--end", ((long)(_videoBar.End * 1000)).ToString(CultureInfo.InvariantCulture),
+            "--start", ((long)Math.Round(_videoBar.Start * 1000)).ToString(CultureInfo.InvariantCulture),
+            "--end", ((long)Math.Round(_videoBar.End * 1000)).ToString(CultureInfo.InvariantCulture),
         };
         foreach (var t in _tracks)
         {
-            double start = t.Bar.Start;
-            double end = t.Bar.End;
+            // Untouched tracks are cut with the clip; moved tracks use their own bars.
+            double start = t.Custom ? t.Bar.Start : _videoBar.Start;
+            double end = t.Custom ? t.Bar.End : _videoBar.End;
             args.Add("--atrack");
             args.Add(string.Format(CultureInfo.InvariantCulture, "{0}:{1}:{2}:{3}:{4}", t.Number, t.Keep.IsChecked == true ? 1 : 0,
-                                   (long)(start * 1000), (long)(end * 1000), (int)t.Volume.Value));
+                                   (long)Math.Round(start * 1000), (long)Math.Round(end * 1000), (int)t.Volume.Value));
         }
 
         SaveButton.IsEnabled = false;

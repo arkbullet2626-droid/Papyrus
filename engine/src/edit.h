@@ -1,9 +1,10 @@
 // Papyrus - clip editing without re-encoding the picture.
 //
 // Reads a Papyrus MP4, keeps a time range of it, and writes a new MP4:
-//   - the video is copied as it is, starting at the keyframe at or before the chosen start (keyframes are 1 s apart)
-//     and ending at any frame;
-//   - each sound track can be kept or dropped, given its own start and end inside the clip, and copied as it is;
+//   - the video is copied as it is. The cut can start on ANY frame: the file carries the frames from the keyframe
+//     before it (keyframes are 1 s apart) and an edit list tells the player to start showing at the chosen frame;
+//   - each sound track can be kept or dropped and has its own start and end, which may reach outside the video's
+//     range; it is copied as it is;
 //   - a track whose volume was changed is the only thing that gets re-encoded (through `regain`, Windows only).
 // Plain C++ (no Windows calls) so the copy path is tested off-Windows. Editing is a one-off job, so unlike the
 // recorder this code is allowed to allocate.
@@ -44,8 +45,9 @@ struct Clip {
     ~Clip() { if (f) fclose(f); }
 };
 
-// What to do with one sound track. Times are milliseconds from the start of the ORIGINAL clip; endMs < 0 = to the end.
-struct TrackEdit { bool keep = true; int64_t startMs = 0, endMs = -1; int gainPercent = 100; };
+// What to do with one sound track. Times are milliseconds from the start of the ORIGINAL clip.
+// startMs < 0 = where the video starts, endMs < 0 = where the video ends.
+struct TrackEdit { bool keep = true; int64_t startMs = -1, endMs = -1; int gainPercent = 100; };
 
 // Re-encodes AAC packets at a new volume. in/out are raw AAC frames. Returns false if it cannot.
 // *extraDelay receives the number of samples the re-encode adds in front (encoder delay).
@@ -259,7 +261,7 @@ static inline bool writePeaks(const PathChar* in, const PathChar* out, int bucke
 }
 
 // startMs/endMs: the part of the clip to keep (endMs < 0 = to the end). edits[i] applies to the i-th sound track.
-// On success *actualStartMs is where the new clip really starts (the keyframe at or before startMs).
+// On success *actualStartMs is where the new clip's picture starts (the chosen frame).
 static inline bool trim(const PathChar* in, const PathChar* out, int64_t startMs, int64_t endMs, const TrackEdit* edits, int nEdits,
                         RegainFn regain, int64_t* actualStartMs, std::string& err) {
     Clip c;
@@ -274,38 +276,52 @@ static inline bool trim(const PathChar* in, const PathChar* out, int64_t startMs
     if (fe > nFrames) fe = nFrames;
     int64_t key = 0;                                            // 0-based index of the keyframe we start on
     for (uint32_t s : v.sync) if ((int64_t)s - 1 <= fs) key = (int64_t)s - 1;
-    if (fe - key < 1) { err = "the selected part is empty"; return false; }
-    const double clipStart = (double)key / fps, clipEnd = (double)fe / fps;      // seconds on the original clip
-    if (actualStartMs) *actualStartMs = (int64_t)(clipStart * 1000.0 + 0.5);
+    if (fs >= fe) { err = "the selected part is empty"; return false; }
+    const double vStart = (double)fs / fps, vEnd = (double)fe / fps;             // what the viewer sees, in seconds on the original clip
+    const double keyTime = (double)key / fps;                                    // where the copied video data really starts
+    if (actualStartMs) *actualStartMs = (int64_t)(vStart * 1000.0 + 0.5);
 
-    struct OutAudio { int src; int64_t first, count; uint32_t emptyMs, skip; uint64_t play; std::vector<std::vector<uint8_t>> re; };
-    std::vector<OutAudio> outs;
+    struct OutAudio { int src; int64_t first, count; uint32_t emptyMs, skip; uint64_t play; double t0; std::vector<std::vector<uint8_t>> re; };
+    struct Want { int src; double t0, t1; TrackEdit e; };
+    std::vector<Want> wants;
     const double R = Mp4Mux::AUDIO_RATE, F = Mp4Mux::AUDIO_FRAME;
+    double movieStart = vStart;                                                  // the earliest thing in the new clip
     for (size_t i = 1; i < c.tracks.size(); i++) {
         const TrackEdit e = (int)(i - 1) < nEdits ? edits[i - 1] : TrackEdit{};
         if (!e.keep || e.gainPercent <= 0) continue;
         const InTrack& a = c.tracks[i];
-        double t0 = clipStart, t1 = clipEnd;
-        if (e.startMs / 1000.0 > t0) t0 = e.startMs / 1000.0;
-        if (e.endMs >= 0 && e.endMs / 1000.0 < t1) t1 = e.endMs / 1000.0;
-        const double trackStart = a.emptyMs / 1000.0;                       // first audible moment of this track
-        const double trackEnd = audioDurationMs(a) / 1000.0;
+        double t0 = e.startMs < 0 ? vStart : e.startMs / 1000.0;
+        double t1 = e.endMs < 0 ? vEnd : e.endMs / 1000.0;
+        const double trackStart = a.emptyMs / 1000.0, trackEnd = audioDurationMs(a) / 1000.0;
         if (t0 < trackStart) t0 = trackStart;
         if (t1 > trackEnd) t1 = trackEnd;
-        if (t1 - t0 < 0.02) continue;                                       // nothing of this track is left
-        const int64_t p0 = (int64_t)((t0 - trackStart) * R + 0.5) + a.skipSamples;   // sample positions in the stored stream
-        const int64_t p1 = (int64_t)((t1 - trackStart) * R + 0.5) + a.skipSamples;
-        int64_t first = p0 / (int64_t)F;
-        if (first > 0) first--;                                             // one packet of run-in so the decoder starts clean
+        if (t1 - t0 < 0.02) continue;                                            // nothing of this track is left
+        if (t0 < movieStart) movieStart = t0;
+        wants.push_back({ (int)i, t0, t1, e });
+    }
+    const bool simple = vStart - movieStart < 0.0005;                            // no sound starts before the picture
+
+    std::vector<OutAudio> outs;
+    for (const Want& w : wants) {
+        const InTrack& a = c.tracks[(size_t)w.src];
+        const double trackStart = a.emptyMs / 1000.0;
+        auto pos = [&](double t) { return (int64_t)((t - trackStart) * R + 0.5) + (int64_t)a.skipSamples; };   // sample position in the stored stream
+        const int64_t p0 = pos(w.t0), p1 = pos(w.t1);
+        // A track that starts with the picture is copied from the same keyframe as the video, so a player that
+        // ignores edit lists still plays picture and sound together (just starting a little early).
+        int64_t from = p0;
+        if (simple && w.t0 - vStart < 0.0005 && keyTime < vStart) { from = pos(keyTime); if (from < (int64_t)a.skipSamples) from = (int64_t)a.skipSamples; }
+        int64_t first = from / (int64_t)F;
+        if (first > 0) first--;                                                  // one packet of run-in so the decoder starts clean
         int64_t last = (p1 - 1) / (int64_t)F;
         if (last >= (int64_t)a.sizes.size()) last = (int64_t)a.sizes.size() - 1;
         if (last < first) continue;
         OutAudio o;
-        o.src = (int)i; o.first = first; o.count = last - first + 1;
+        o.src = w.src; o.first = first; o.count = last - first + 1; o.t0 = w.t0;
         o.skip = (uint32_t)(p0 - first * (int64_t)F);
         o.play = (uint64_t)(p1 - p0);
-        o.emptyMs = (uint32_t)((t0 - clipStart) * 1000.0 + 0.5);
-        if (e.gainPercent != 100) {
+        o.emptyMs = (uint32_t)((w.t0 - movieStart) * 1000.0 + 0.5);
+        if (w.e.gainPercent != 100) {
             if (!regain) { err = "changing a track's volume is not available here"; return false; }
             std::vector<std::vector<uint8_t>> src((size_t)o.count);
             for (int64_t k = 0; k < o.count; k++) {
@@ -314,7 +330,7 @@ static inline bool trim(const PathChar* in, const PathChar* out, int64_t startMs
                     fread(src[(size_t)k].data(), 1, src[(size_t)k].size(), c.f) != src[(size_t)k].size()) { err = "could not read the clip"; return false; }
             }
             uint32_t extra = 0;
-            if (!regain(src, e.gainPercent, o.re, &extra) || o.re.empty()) { err = "could not change the volume of a sound track"; return false; }
+            if (!regain(src, w.e.gainPercent, o.re, &extra) || o.re.empty()) { err = "could not change the volume of a sound track"; return false; }
             o.skip += extra;
         }
         outs.push_back(std::move(o));
@@ -325,14 +341,17 @@ static inline bool trim(const PathChar* in, const PathChar* out, int64_t startMs
     uint64_t maxAudio = 1;
     for (auto& o : outs) { const uint64_t n = o.re.empty() ? (uint64_t)o.count : o.re.size(); if (n > maxAudio) maxAudio = n; }
     if (!m.init((uint64_t)(fe - key), maxAudio, v.width, v.height, fps)) { err = "out of memory"; return false; }
+    m.tr[0].skipSamples = (uint32_t)(fs - key);                                  // frames before the cut: decoded, not shown
+    m.tr[0].emptyMs = (uint32_t)((vStart - movieStart) * 1000.0 + 0.5);          // sound that starts before the picture
     struct Item { int track; int64_t idx; };
     std::vector<Item> order;
     std::vector<int64_t> cur(outs.size(), 0);
+    auto audioTime = [&](size_t a) { return outs[a].emptyMs / 1000.0 + ((double)cur[a] * F - outs[a].skip) / R; };   // on the new clip's timeline
     for (int64_t f = key; f < fe; f++) {
-        const double tv = (double)(f - key) / fps;
+        const double tv = m.tr[0].emptyMs / 1000.0 + (double)(f - fs) / fps;
         for (size_t a = 0; a < outs.size(); a++) {
             const int64_t n = outs[a].re.empty() ? outs[a].count : (int64_t)outs[a].re.size();
-            while (cur[a] < n && outs[a].emptyMs / 1000.0 + ((double)cur[a] * F - outs[a].skip) / R <= tv) order.push_back({ (int)a + 1, cur[a]++ });
+            while (cur[a] < n && audioTime(a) <= tv) order.push_back({ (int)a + 1, cur[a]++ });
         }
         order.push_back({ 0, f });
     }

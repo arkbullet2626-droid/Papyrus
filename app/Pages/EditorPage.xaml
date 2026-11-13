@@ -35,7 +35,7 @@
                             <Button x:Name="ResetButton" Content="Reset" Click="Reset_Click" IsEnabled="False" />
                         </StackPanel>
                         <TextBlock Style="{StaticResource CaptionStyle}"
-                                   Text="Drag the bar on each side to cut the clip. The left bar moves in 1-second steps so the picture can be copied without losing any quality. Click anywhere on a strip to jump there." />
+                                   Text="Drag the bar on each side to cut the clip. The bars move one frame at a time and the picture is copied without losing any quality. Click anywhere on a strip to jump there." />
                     </StackPanel>
                 </Border>
 
@@ -46,7 +46,7 @@
                         <TextBlock x:Name="NoTracksLabel" Text="This clip has no sound." Style="{StaticResource CaptionStyle}" />
                         <StackPanel x:Name="TracksPanel" Spacing="16" />
                         <TextBlock Style="{StaticResource CaptionStyle}"
-                                   Text="Each strip shows how loud that track is over time. The tracks follow the clip's bars; drag a track's own bars to shorten just that track. They snap to the clip's ends when close. Listen picks which track you hear while previewing; untick Keep to leave a track out of the saved clip. Changing the volume re-encodes that track only." />
+                                   Text="Each strip shows how loud that track is over time. A track follows the clip until you move its bars; after that it plays exactly where its bars are, even before or after the picture. Its bars snap to the clip's ends when close. Reset links every track to the clip again. Listen picks which track you hear while previewing; untick Keep to leave a track out. Changing the volume re-encodes that track only." />
                     </StackPanel>
                 </Border>
 

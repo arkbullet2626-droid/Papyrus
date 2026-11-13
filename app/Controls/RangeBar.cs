@@ -29,7 +29,7 @@ public sealed class RangeBar : Grid
     public double Duration { get; private set; } = 1;
     public double Start { get; private set; }
     public double End { get; private set; } = 1;
-    /// <summary>The left bar moves in steps of this many seconds (0 = freely).</summary>
+    /// <summary>The bars move in steps of this many seconds (0 = freely). The editor uses one video frame.</summary>
     public double StartStep { get; set; }
     public double MinLength { get; set; } = 0.5;
     /// <summary>The bars cannot be dragged outside this part of the timeline (used to keep a sound track inside the clip).</summary>
@@ -137,9 +137,12 @@ public sealed class RangeBar : Grid
         {
             if (StartStep > 0) t = Math.Round(t / StartStep) * StartStep;
             Start = Math.Clamp(t, 0, Math.Max(0, End - MinLength));
-            if (StartStep > 0) Start = Math.Floor(Start / StartStep) * StartStep;
         }
-        else if (_drag == 2) End = Math.Clamp(t, Math.Min(Duration, Start + MinLength), Duration);
+        else if (_drag == 2)
+        {
+            if (StartStep > 0) t = Math.Round(t / StartStep) * StartStep;
+            End = Math.Clamp(t, Math.Min(Duration, Start + MinLength), Duration);
+        }
         Arrange();
         RangeChanged?.Invoke();
     }
